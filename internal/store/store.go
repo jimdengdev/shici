@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql" // MySQL 驱动（纯 Go）
-	_ "modernc.org/sqlite"              // 纯 Go SQLite 驱动
+	"github.com/go-sql-driver/mysql" // MySQL 驱动（纯 Go）
+	_ "modernc.org/sqlite"           // 纯 Go SQLite 驱动
 
 	"shici/data"
 	"shici/internal/model"
@@ -110,10 +110,42 @@ func Open(path string) (*Store, error) {
 	return open(dialectSQLite, dsn)
 }
 
-// OpenMySQL 打开 MySQL 数据库（需 utf8mb4 + parseTime）；库为空时灌入种子数据。
+// OpenMySQL 打开 MySQL 数据库（需 utf8mb4 + parseTime）；库不存在时自动创建（utf8mb4）。
 // DSN 示例：user:pass@tcp(127.0.0.1:3306)/shici?charset=utf8mb4&parseTime=true&loc=Local
 func OpenMySQL(dsn string) (*Store, error) {
-	return open(dialectMySQL, dsn)
+	s, err := open(dialectMySQL, dsn)
+	if err == nil {
+		return s, nil
+	}
+	// 库不存在（MySQL 错误码 1049）→ 自动建库后重试
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) && myErr.Number == 1049 {
+		if createErr := createMySQLDatabase(dsn); createErr == nil {
+			return open(dialectMySQL, dsn)
+		}
+	}
+	return nil, err
+}
+
+// createMySQLDatabase 从 DSN 解析库名，连到服务端（不带库）创建 utf8mb4 数据库。
+func createMySQLDatabase(dsn string) error {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return err
+	}
+	name := cfg.DBName
+	if name == "" {
+		return errors.New("DSN 中未指定数据库名")
+	}
+	cfg.DBName = ""
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(fmt.Sprintf(
+		"CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci", name))
+	return err
 }
 
 func open(d dialect, dsn string) (*Store, error) {
@@ -125,9 +157,15 @@ func open(d dialect, dsn string) (*Store, error) {
 	if d.maxOpen > 1 {
 		db.SetConnMaxLifetime(time.Hour) // 连接池防陈旧连接（MySQL）
 	}
-	if _, err := db.Exec(d.ddl); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("建表失败: %w", err)
+	// MySQL 驱动默认不支持单次 Exec 多语句，按语句逐条建表（双方言通用）
+	for _, stmt := range strings.Split(d.ddl, ";") {
+		if strings.TrimSpace(stmt) == "" {
+			continue
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("建表失败: %w", err)
+		}
 	}
 	s := &Store{db: db, d: d}
 	if err := s.seedIfEmpty(); err != nil {

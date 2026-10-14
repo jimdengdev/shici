@@ -1,0 +1,29 @@
+# 诗词雅集 — 1Panel / Docker Compose 编排
+#
+# 用法：
+#   1. 复制 .env.example 为 .env，填写 MySQL 连接信息（宿主机 1Panel 安装的 MySQL）
+#   2. 1Panel → 容器 → 编排 → 创建编排，选择本目录（或先 git clone 到服务器）
+#   3. 启动后访问 http://服务器IP:8080，后台 /admin
+#
+# 说明：
+#   - 使用宿主机 MySQL 时已通过 extra_hosts 把 host.docker.internal 指向宿主；
+#     SHICI_MYSQL_DSN 里填 tcp(host.docker.internal:3306)
+#   - 不设置 SHICI_MYSQL_DSN 时自动退回容器内 SQLite（挂载 ./data 持久化）
+
+services:
+  shici:
+    build: .
+    image: shici:latest
+    container_name: shici
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      PORT: 8080
+      ADMIN_USER: "${ADMIN_USER:-admin}"
+      ADMIN_PASS: "${ADMIN_PASS:?请在 .env 中设置后台密码}"
+      SHICI_MYSQL_DSN: "${SHICI_MYSQL_DSN:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # 容器访问宿主机 MySQL（1Panel 安装）
+    volumes:
+      - ./data:/app/data # SQLite 回退模式的数据持久化目录

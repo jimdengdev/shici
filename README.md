@@ -78,3 +78,29 @@ data/seed.go           公有种子数据（117 首诗词 + 51 位诗人）
 - 单二进制 + SQLite 文件即可运行，适合小内存 VPS / 容器
 - 建议用 systemd / Docker 常驻，反向代理套 HTTPS
 - 站点为公益用途：无广告、无追踪，欢迎传播与二次开发
+
+## 部署到 1Panel（Docker 编排）
+
+仓库已内置 `Dockerfile` + `compose.yml` + `.env.example`：
+
+```bash
+# 1. 在服务器上拉取代码
+git clone https://github.com/jimdengdev/shici.git && cd shici
+
+# 2. 准备环境变量（后台密码 + MySQL 连接）
+cp .env.example .env && vi .env
+#    使用宿主机 1Panel 安装的 MySQL 时，DSN 填：
+#    root:密码@tcp(host.docker.internal:3306)/shici?charset=utf8mb4&parseTime=true&loc=Local
+
+# 3a. 直接启动（或用 1Panel → 容器 → 编排 → 创建编排指向本目录）
+docker compose up -d --build
+
+# 3b. 也可以用 1Panel 网页：容器 → 编排 → 创建编排 → 路径选本目录
+```
+
+要点：
+
+- MySQL 库不存在会**自动建库**（utf8mb4）并灌入种子数据；也可以先用 `go run ./cmd/mkdb` 手动建库
+- `compose.yml` 已配置 `host.docker.internal:host-gateway`，容器内可直达宿主机 MySQL
+- 不设置 `SHICI_MYSQL_DSN` 时自动回退容器内 SQLite，`./data` 目录已挂载持久化
+- 反向代理：1Panel → 网站 → 创建网站，代理到 `http://127.0.0.1:8080` 即可套 HTTPS
