@@ -12,13 +12,14 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动
+	_ "github.com/go-sql-driver/mysql" // MySQL 驱动（纯 Go）
+	_ "modernc.org/sqlite"              // 纯 Go SQLite 驱动
 
 	"shici/data"
 	"shici/internal/model"
 )
 
-const schema = `
+const sqliteSchema = `
 CREATE TABLE IF NOT EXISTS poets (
   id      INTEGER PRIMARY KEY AUTOINCREMENT,
   name    TEXT NOT NULL UNIQUE,
@@ -42,6 +43,44 @@ CREATE INDEX IF NOT EXISTS idx_poems_poet_name ON poems(poet_name);
 CREATE INDEX IF NOT EXISTS idx_poems_dynasty ON poems(dynasty);
 `
 
+const mysqlSchema = `
+CREATE TABLE IF NOT EXISTS poets (
+  id      INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name    VARCHAR(64) NOT NULL UNIQUE,
+  dynasty VARCHAR(32) NOT NULL DEFAULT '',
+  intro   TEXT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS poems (
+  id        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  title     VARCHAR(255) NOT NULL,
+  poet_id   INT UNSIGNED NOT NULL,
+  poet_name VARCHAR(64) NOT NULL DEFAULT '',
+  dynasty   VARCHAR(32) NOT NULL DEFAULT '',
+  genre     VARCHAR(32) NOT NULL DEFAULT '',
+  content   MEDIUMTEXT NOT NULL,
+  tags      VARCHAR(255) NOT NULL DEFAULT '',
+  note      TEXT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_poems_poet FOREIGN KEY (poet_id) REFERENCES poets(id) ON DELETE CASCADE,
+  KEY idx_poems_title (title),
+  KEY idx_poems_poet_name (poet_name),
+  KEY idx_poems_dynasty (dynasty)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+`
+
+// dialect 方言差异：DDL、随机函数、连接池策略。
+type dialect struct {
+	driver  string
+	ddl     string
+	randFn  string // SQLite: RANDOM() / MySQL: RAND()
+	maxOpen int    // 连接池上限（SQLite 串行化防锁冲突）
+}
+
+var (
+	dialectSQLite = dialect{driver: "sqlite", ddl: sqliteSchema, randFn: "RANDOM()", maxOpen: 1}
+	dialectMySQL  = dialect{driver: "mysql", ddl: mysqlSchema, randFn: "RAND()", maxOpen: 10}
+)
+
 // Filter 诗词检索过滤条件。
 type Filter struct {
 	Keyword  string // 关键词：匹配标题 / 正文 / 诗人 / 标签
@@ -54,26 +93,43 @@ type Filter struct {
 }
 
 // Store 数据存储。
-type Store struct{ db *sql.DB }
+type Store struct {
+	db *sql.DB
+	d  dialect
+}
 
-// Open 打开（或创建）数据库；库为空时灌入种子数据。
+// Open 打开（或创建）SQLite 数据库；库为空时灌入种子数据。
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, err
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	// 启用外键级联删除与忙等待（modernc/sqlite 连接级 PRAGMA）
+	dsn := fmt.Sprintf("%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
+	return open(dialectSQLite, dsn)
+}
+
+// OpenMySQL 打开 MySQL 数据库（需 utf8mb4 + parseTime）；库为空时灌入种子数据。
+// DSN 示例：user:pass@tcp(127.0.0.1:3306)/shici?charset=utf8mb4&parseTime=true&loc=Local
+func OpenMySQL(dsn string) (*Store, error) {
+	return open(dialectMySQL, dsn)
+}
+
+func open(d dialect, dsn string) (*Store, error) {
+	db, err := sql.Open(d.driver, dsn)
 	if err != nil {
 		return nil, err
 	}
-	// modernc/sqlite 并发写易出锁问题，串行化最稳
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
+	db.SetMaxOpenConns(d.maxOpen)
+	if d.maxOpen > 1 {
+		db.SetConnMaxLifetime(time.Hour) // 连接池防陈旧连接（MySQL）
+	}
+	if _, err := db.Exec(d.ddl); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("建表失败: %w", err)
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, d: d}
 	if err := s.seedIfEmpty(); err != nil {
 		db.Close()
 		return nil, err
@@ -227,9 +283,9 @@ func (s *Store) PrevNext(id int64) (prev, next *model.Poem) {
 	return
 }
 
-// RandomPoem 随机一首。
+// RandomPoem 随机一首（SQLite: RANDOM() / MySQL: RAND()）。
 func (s *Store) RandomPoem() (model.Poem, error) {
-	row := s.db.QueryRow(`SELECT ` + poemCols + ` FROM poems p ORDER BY RANDOM() LIMIT 1`)
+	row := s.db.QueryRow(`SELECT ` + poemCols + ` FROM poems p ORDER BY ` + s.d.randFn + ` LIMIT 1`)
 	m, err := scanPoem(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Poem{}, ErrNotFound

@@ -6,12 +6,26 @@
 
 ```bash
 go build -o server ./cmd/server
-./server                       # http://localhost:8080
-# 自定义端口 / 数据库 / 管理员：
-PORT=9000 SHICI_DB=./data/shici.db ADMIN_USER=admin ADMIN_PASS=你的密码 ./server
+./server                       # http://localhost:8080（默认 SQLite，零依赖）
 ```
 
-首次启动自动建库（SQLite，`data/shici.db`）并灌入内置种子数据：**117 首名篇 + 51 位诗人小传**（先秦至清，诗 / 词 / 散曲 / 乐府）。
+首次启动自动建库并灌入内置种子数据：**117 首名篇 + 51 位诗人小传**（先秦至清，诗 / 词 / 散曲 / 乐府）。
+
+### 存储：SQLite（默认）/ MySQL
+
+默认使用 SQLite（`data/shici.db`，`modernc.org/sqlite` 纯 Go 无 CGO），开箱即用。
+
+设置 `SHICI_MYSQL_DSN` 即切换到 MySQL（需 MySQL 5.7+ / 8.0+，InnoDB，utf8mb4）：
+
+```bash
+# 建库：CREATE DATABASE shici CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+SHICI_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/shici?charset=utf8mb4&parseTime=true&loc=Local' \
+PORT=8080 ADMIN_USER=admin ADMIN_PASS=你的密码 ./server
+```
+
+- 首次连接自动建表、自动灌入种子数据（两种后端行为一致）
+- 删诗人会级联删除其名下作品（两种后端均启用外键）
+- 环境变量：`PORT`、`SHICI_DB`（SQLite 路径）、`SHICI_MYSQL_DSN`（二选一）、`ADMIN_USER` / `ADMIN_PASS` / `ADMIN_HASH`
 
 ## 前台功能
 
@@ -44,7 +58,7 @@ GET /api/search?q=黄河       # 检索别名
 ## 技术要点
 
 - **Iris v12**：路由 / 视图引擎（`view.HTML`，内嵌模板 + 布局 `{{ yield . }}`）/ sessions
-- **SQLite**（`modernc.org/sqlite`，纯 Go 无 CGO）：自动建表、自动种子；关键词检索走 `LIKE` 多列匹配
+- **双存储后端**：SQLite（`modernc.org/sqlite` 纯 Go 无 CGO，默认）与 MySQL（`go-sql-driver/mysql`），方言差异（DDL / `RANDOM()` vs `RAND()` / 连接池）收敛在 `internal/store`，业务层无感
 - **零外部资源**：模板、样式全部 `go:embed` 内嵌，单二进制部署；古典水墨风 CSS
 - 今日诗词按日期确定性轮换（同一天稳定、跨天更换）
 

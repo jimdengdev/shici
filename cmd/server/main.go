@@ -24,8 +24,14 @@ func envOr(key, def string) string {
 }
 
 func main() {
-	dbPath := envOr("SHICI_DB", "data/shici.db")
-	st, err := store.Open(dbPath)
+	// 存储后端：设置 SHICI_MYSQL_DSN 时使用 MySQL，否则使用零依赖的 SQLite
+	var st *store.Store
+	var err error
+	if dsn := os.Getenv("SHICI_MYSQL_DSN"); dsn != "" {
+		st, err = store.OpenMySQL(dsn)
+	} else {
+		st, err = store.Open(envOr("SHICI_DB", "data/shici.db"))
+	}
 	if err != nil {
 		log.Fatalf("打开数据库失败: %v", err)
 	}
