@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ if .Title }}{{ .Title }} · {{ end }}诗词雅集 · 后台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="admin-body">
+  <div class="admin-shell">
+    <aside class="admin-side">
+      <a class="admin-logo" href="/admin">雅集 · 后台</a>
+      <nav>
+        <a href="/admin">仪表盘</a>
+        <a href="/admin/poems">诗词管理</a>
+        <a href="/admin/poets">诗人管理</a>
+        <hr>
+        <a href="/" target="_blank">查看前台 ↗</a>
+        <a href="/admin/logout">退出登录</a>
+      </nav>
+    </aside>
+    <main class="admin-main">
+      {{ yield . }}
+    </main>
+  </div>
+</body>
+</html>

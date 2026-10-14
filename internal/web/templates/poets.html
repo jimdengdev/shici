@@ -1,0 +1,33 @@
+<h2 class="page-title">诗人 {{ if .Keyword }}<span class="muted">— 检索“{{ .Keyword }}”</span>{{ end }}</h2>
+
+<form class="filter-panel" action="/poets" method="get">
+  <div class="filter-fields">
+    <label>关键词 <input type="search" name="keyword" value="{{ .Keyword }}" placeholder="姓名 / 小传"></label>
+    <label>朝代
+      <select name="dynasty">
+        <option value="">全部</option>
+        {{ range .Dynasties }}<option value="{{ . }}" {{ if eq $.Dynasty . }}selected{{ end }}>{{ . }}</option>{{ end }}
+      </select>
+    </label>
+    <button type="submit" class="btn-primary">检索</button>
+    <a class="btn-ghost" href="/poets">重置</a>
+  </div>
+</form>
+
+<p class="result-info">共 {{ .Total }} 位 · 亦可在<a href="/poems">诗词检索</a>中按诗人筛选</p>
+
+{{ range .Order }}
+<section class="dynasty-group">
+  <h3 class="dynasty-title">{{ . }}</h3>
+  <ul class="poet-grid">
+    {{ range index $.Groups . }}
+    <li class="poet-card">
+      <h4><a href="/poets/{{ .ID }}">{{ .Name }}</a> <span class="muted">{{ .PoemCount }} 首</span></h4>
+      <p>{{ if .Intro }}{{ .Intro }}{{ else }}暂无简介{{ end }}</p>
+    </li>
+    {{ end }}
+  </ul>
+</section>
+{{ else }}
+<div class="empty"><p>未找到相关诗人。</p></div>
+{{ end }}

@@ -1,0 +1,48 @@
+<h2 class="page-title">诗词检索 {{ if .Keyword }}<span class="muted">— “{{ .Keyword }}”</span>{{ end }}</h2>
+
+<form class="filter-panel" action="/poems" method="get">
+  <div class="filter-fields">
+    <label>关键词 <input type="search" name="keyword" value="{{ .Filter.Keyword }}" placeholder="诗题 / 诗句 / 标签"></label>
+    <label>诗人 <input type="search" name="poet" value="{{ .Filter.Poet }}" placeholder="如：李白"></label>
+    <label>朝代
+      <select name="dynasty">
+        <option value="">全部</option>
+        {{ range .Dynasties }}<option value="{{ . }}" {{ if eq $.Filter.Dynasty . }}selected{{ end }}>{{ . }}</option>{{ end }}
+      </select>
+    </label>
+    <label>体裁
+      <select name="genre">
+        <option value="">全部</option>
+        {{ range .Genres }}<option value="{{ . }}" {{ if eq $.Filter.Genre . }}selected{{ end }}>{{ . }}</option>{{ end }}
+      </select>
+    </label>
+    <button type="submit" class="btn-primary">检索</button>
+    <a class="btn-ghost" href="/poems">重置</a>
+  </div>
+</form>
+
+<p class="result-info">共 {{ .Total }} 首 · 第 {{ .Page }} / {{ .Pages }} 页</p>
+
+{{ if .Poems }}
+<ul class="poem-list">
+  {{ range .Poems }}
+  <li class="poem-item">
+    <div class="poem-item-main">
+      <h3><a href="/poems/{{ .ID }}">{{ .Title }}</a></h3>
+      <p class="poem-item-excerpt">{{ .Excerpt }}</p>
+    </div>
+    <div class="poem-item-meta">
+      <a class="poet-link" href="/poets/{{ .PoetID }}">{{ .PoetName }}</a>
+      <span>{{ .Dynasty }} · {{ .Genre }}</span>
+      {{ range .TagList }}<a class="tag" href="/poems?tag={{ . }}">#{{ . }}</a>{{ end }}
+    </div>
+  </li>
+  {{ end }}
+</ul>
+{{ render "partials/pagination.html" . }}
+{{ else }}
+<div class="empty">
+  <p>未找到相关诗词。</p>
+  <p class="muted">换个关键词试试？例如「明月」「江南」「苏轼」。</p>
+</div>
+{{ end }}

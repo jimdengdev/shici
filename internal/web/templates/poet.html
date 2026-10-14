@@ -1,0 +1,24 @@
+<article class="poet-page">
+  <header class="poet-page-head">
+    <h2>{{ .Poet.Name }}</h2>
+    <p class="muted">{{ .Poet.Dynasty }} · 收录作品 {{ .Poet.PoemCount }} 首</p>
+  </header>
+  {{ if .Poet.Intro }}
+  <section class="poet-intro">
+    <h4>小传</h4>
+    <p>{{ .Poet.Intro }}</p>
+  </section>
+  {{ end }}
+  <h4 class="poet-works-title">作品</h4>
+  <ul class="poem-list">
+    {{ range .Poems }}
+    <li class="poem-item">
+      <div class="poem-item-main">
+        <h3><a href="/poems/{{ .ID }}">{{ .Title }}</a></h3>
+        <p class="poem-item-excerpt">{{ .Excerpt }}</p>
+      </div>
+      <div class="poem-item-meta"><span>{{ .Genre }}</span></div>
+    </li>
+    {{ end }}
+  </ul>
+</article>

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ if .Title }}{{ .Title }} · {{ end }}诗词雅集</title>
+  <meta name="description" content="公益中国诗词站点：免费检索、阅读中国古典诗词名篇。">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="logo" href="/"><span class="seal">雅</span>诗词雅集</a>
+      <form class="search" action="/poems" method="get">
+        <input type="search" name="keyword" value="{{ .Keyword }}" placeholder="诗题 / 诗句 / 诗人 / 标签…">
+        <button type="submit">检索</button>
+      </form>
+      <nav class="site-nav">
+        <a href="/">首页</a>
+        <a href="/poems">诗词</a>
+        <a href="/poets">诗人</a>
+        <a href="/random" title="随机一首">遇一首</a>
+        <a href="/about">关于</a>
+      </nav>
+    </div>
+    <div class="wrap dynasty-bar">
+      <span class="bar-label">朝代</span>
+      {{ range .Dynasties }}<a class="dyn-link" href="/poems?dynasty={{ . }}">{{ . }}</a>{{ end }}
+    </div>
+  </header>
+
+  <main class="wrap">
+    {{ yield . }}
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <p>诗词雅集 · 公益项目 — 全部诗词文本属公有领域，免费开放，欢迎传播。</p>
+      <p class="muted">开放 API：/api/poems?keyword=… · /api/poets?keyword=… · /api/search?q=…</p>
+    </div>
+  </footer>
+</body>
+</html>

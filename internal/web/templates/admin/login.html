@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · 诗词雅集后台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <a class="logo" href="/"><span class="seal">雅</span>诗词雅集</a>
+    <h2>后台管理</h2>
+    {{ if .Error }}<p class="form-error">账号或密码不正确</p>{{ end }}
+    <form action="/admin/login" method="post">
+      <label>账号 <input type="text" name="username" required autofocus></label>
+      <label>密码 <input type="password" name="password" required></label>
+      <button type="submit" class="btn-primary">登 录</button>
+    </form>
+    <p class="muted small">默认账号 admin / shici@2024，可用环境变量 ADMIN_USER / ADMIN_PASS 修改</p>
+  </div>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<section class="hero">
+  <p class="hero-kicker">今日诗词</p>
+  <h2 class="hero-title"><a href="/poems/{{ .Daily.ID }}">{{ .Daily.Title }}</a></h2>
+  <p class="hero-poet">
+    {{ if .Daily.PoetID }}<a href="/poets/{{ .Daily.PoetID }}">{{ .Daily.PoetName }}</a>{{ else }}{{ .Daily.PoetName }}{{ end }}
+    <span class="dot">·</span> {{ .Daily.Dynasty }} <span class="dot">·</span> {{ .Daily.Genre }}
+  </p>
+  <div class="hero-lines">
+    {{ range .Daily.Lines }}<p>{{ . }}</p>{{ end }}
+  </div>
+  {{ if .Daily.Note }}<blockquote class="hero-note">{{ .Daily.Note }}</blockquote>{{ end }}
+</section>
+
+<section class="stats-row">
+  <div class="stat"><b>{{ .Stats.Poems }}</b><span>收录诗词</span></div>
+  <div class="stat"><b>{{ .Stats.Poets }}</b><span>收录诗人</span></div>
+  {{ range .Stats.ByDynasty }}{{ if gt .N 0 }}<div class="stat"><b>{{ .N }}</b><span>{{ .Label }}</span></div>{{ end }}{{ end }}
+</section>
+
+<section>
+  <div class="section-head">
+    <h3>名篇撷英</h3>
+    <a class="more" href="/poems">浏览全部 →</a>
+  </div>
+  <ul class="poem-grid">
+    {{ range .Featured }}
+    <li class="poem-card">
+      <h4><a href="/poems/{{ .ID }}">{{ .Title }}</a></h4>
+      <p class="card-poet"><a href="/poets/{{ .PoetID }}">{{ .PoetName }}</a> · {{ .Dynasty }}</p>
+      <p class="card-excerpt">{{ .Excerpt }}</p>
+    </li>
+    {{ end }}
+  </ul>
+</section>

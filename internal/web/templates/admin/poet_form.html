@@ -1,0 +1,19 @@
+<div class="section-head">
+  <h2>{{ if .Poet.ID }}编辑诗人{{ else }}新增诗人{{ end }}</h2>
+  <a class="btn-ghost" href="/admin/poets">← 返回列表</a>
+</div>
+
+{{ if .Error }}<p class="form-error">{{ .Error }}</p>{{ end }}
+
+<form class="admin-form" action="{{ .Action }}" method="post">
+  {{ if .Poet.ID }}<input type="hidden" name="id" value="{{ .Poet.ID }}">{{ end }}
+  <div class="form-row">
+    <label>姓名 <input type="text" name="name" value="{{ .Poet.Name }}" required></label>
+    <label>朝代 <input type="text" name="dynasty" value="{{ .Poet.Dynasty }}" placeholder="如：唐"></label>
+  </div>
+  <label>小传 <textarea name="intro" rows="5">{{ .Poet.Intro }}</textarea></label>
+  <div class="form-actions">
+    <button type="submit" class="btn-primary">保 存</button>
+    <a class="btn-ghost" href="/admin/poets">取消</a>
+  </div>
+</form>

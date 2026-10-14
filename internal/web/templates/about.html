@@ -1,0 +1,29 @@
+<article class="about">
+  <h2>关于「诗词雅集」</h2>
+  <p>「诗词雅集」是一个纯公益的中国古典诗词阅读站点，目标是让任何人都能免费、便捷地检索与阅读中国古典诗词名篇。</p>
+
+  <h4>公益与版权</h4>
+  <ul>
+    <li>全部诗词文本均为公有领域的古典文学作品，不涉及版权限制。</li>
+    <li>站点免费开放，无广告、无追踪，欢迎自由分享与二次开发（源码 MIT 协议）。</li>
+  </ul>
+
+  <h4>检索指南</h4>
+  <ul>
+    <li><b>关键词检索</b>：支持诗题、诗句、诗人、标签的模糊匹配，如<a href="/poems?keyword=明月">「明月」</a>、<a href="/poems?keyword=江南">「江南」</a>。</li>
+    <li><b>诗人检索</b>：<a href="/poets">诗人页</a>可按姓名、小传检索；诗词列表亦支持按诗人名筛选，如<a href="/poems?poet=李白">李白作品</a>。</li>
+    <li><b>筛选</b>：诗词列表支持朝代、体裁（诗、词、散曲）组合筛选。</li>
+  </ul>
+
+  <h4>开放 API</h4>
+  <ul>
+    <li><code>GET /api/poems?keyword=明月&amp;poet=李白&amp;dynasty=唐&amp;page=1</code> — 诗词检索</li>
+    <li><code>GET /api/poems/{id}</code> — 单首详情</li>
+    <li><code>GET /api/poets?keyword=苏轼</code> — 诗人检索</li>
+    <li><code>GET /api/poets/{id}</code> — 诗人详情（含作品）</li>
+    <li><code>GET /api/search?q=黄河</code> — 检索别名</li>
+  </ul>
+
+  <h4>后台管理</h4>
+  <p>站点内容通过 <code>/admin</code> 后台维护，收录、修订、扩充诗词与诗人资料。</p>
+</article>

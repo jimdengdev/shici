@@ -1,0 +1,7 @@
+{{ if or .PageURLs.Prev .PageURLs.Next }}
+<nav class="pagination">
+  {{ if .PageURLs.Prev }}<a class="pg" href="{{ .PageURLs.Prev }}">← 上一页</a>{{ end }}
+  <span class="pg-info">{{ if .Page }}{{ .Page }}{{ else }}{{ .PageURLs.Page }}{{ end }} / {{ .PageURLs.Pages }}</span>
+  {{ if .PageURLs.Next }}<a class="pg" href="{{ .PageURLs.Next }}">下一页 →</a>{{ end }}
+</nav>
+{{ end }}

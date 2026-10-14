@@ -1,0 +1,30 @@
+<div class="section-head">
+  <h2>{{ if .Poem.ID }}编辑诗词{{ else }}新增诗词{{ end }}</h2>
+  <a class="btn-ghost" href="/admin/poems">← 返回列表</a>
+</div>
+
+{{ if .Error }}<p class="form-error">{{ .Error }}</p>{{ end }}
+
+<form class="admin-form" action="{{ .Action }}" method="post">
+  {{ if .Poem.ID }}<input type="hidden" name="id" value="{{ .Poem.ID }}">{{ end }}
+  <label>标题 <input type="text" name="title" value="{{ .Poem.Title }}" required></label>
+  <div class="form-row">
+    <label>诗人
+      <select name="poet_id" required>
+        {{ range .Poets }}
+        <option value="{{ .ID }}" {{ if eq $.Poem.PoetID .ID }}selected{{ end }}>{{ .Name }}（{{ .Dynasty }}）</option>
+        {{ end }}
+      </select>
+    </label>
+    <label>体裁 <input type="text" name="genre" value="{{ .Poem.Genre }}" placeholder="如：七言绝句 / 词"></label>
+  </div>
+  <label>正文（<b>每行一句</b>，可含标点）
+    <textarea name="content" rows="10" required>{{ .Poem.Content }}</textarea>
+  </label>
+  <label>标签（逗号分隔）<input type="text" name="tags" value="{{ .Poem.Tags }}" placeholder="如：思乡,月亮"></label>
+  <label>题解 / 译文（可选）<textarea name="note" rows="3">{{ .Poem.Note }}</textarea></label>
+  <div class="form-actions">
+    <button type="submit" class="btn-primary">保 存</button>
+    <a class="btn-ghost" href="/admin/poems">取消</a>
+  </div>
+</form>

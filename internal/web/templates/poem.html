@@ -1,0 +1,38 @@
+<article class="poem-page">
+  <header class="poem-page-head">
+    <h2 class="poem-page-title">{{ .Poem.Title }}</h2>
+    <p class="poem-page-poet">
+      {{ if .Poet.ID }}<a href="/poets/{{ .Poet.ID }}">{{ .Poem.PoetName }}</a>{{ else }}{{ .Poem.PoetName }}{{ end }}
+      <span class="dot">·</span> {{ .Poem.Dynasty }} <span class="dot">·</span> {{ .Poem.Genre }}
+    </p>
+  </header>
+
+  <div class="poem-page-body">
+    {{ range .Poem.Lines }}<p>{{ . }}</p>{{ end }}
+  </div>
+
+  {{ if .Poem.Note }}
+  <section class="poem-note">
+    <h4>题解</h4>
+    <p>{{ .Poem.Note }}</p>
+  </section>
+  {{ end }}
+
+  {{ if .Poem.TagList }}
+  <p class="poem-tags">{{ range .Poem.TagList }}<a class="tag" href="/poems?tag={{ . }}">#{{ . }}</a>{{ end }}</p>
+  {{ end }}
+
+  <nav class="poem-adjacent">
+    {{ if .Prev }}<a class="adj prev" href="/poems/{{ .Prev.ID }}">← {{ .Prev.Title }}</a>{{ else }}<span></span>{{ end }}
+    <a class="adj random" href="/random">遇一首</a>
+    {{ if .Next }}<a class="adj next" href="/poems/{{ .Next.ID }}">{{ .Next.Title }} →</a>{{ else }}<span></span>{{ end }}
+  </nav>
+</article>
+
+{{ if and .Poet.Name .Poet.Intro }}
+<aside class="poet-aside">
+  <h4><a href="/poets/{{ .Poet.ID }}">{{ .Poet.Name }}</a>（{{ .Poet.Dynasty }}）</h4>
+  <p>{{ .Poet.Intro }}</p>
+  <a class="more" href="/poets/{{ .Poet.ID }}">查看其全部作品 →</a>
+</aside>
+{{ end }}
