@@ -2,7 +2,7 @@
 
 <form class="filter-panel" action="/poems" method="get">
   <div class="filter-fields">
-    <label>关键词 <input type="search" name="keyword" value="{{ .Filter.Keyword }}" placeholder="诗题 / 诗句 / 标签"></label>
+    <label>关键词 <input type="search" name="keyword" value="{{ .Filter.Keyword }}" placeholder="诗题 / 诗句 / 诗人"></label>
     <label>诗人 <input type="search" name="poet" value="{{ .Filter.Poet }}" placeholder="如：李白"></label>
     <label>朝代
       <select name="dynasty">
@@ -32,8 +32,8 @@
       <p class="poem-item-excerpt">{{ .Excerpt }}</p>
     </div>
     <div class="poem-item-meta">
-      <a class="poet-link" href="/poets/{{ .PoetID }}">{{ .PoetName }}</a>
-      <span>{{ .Dynasty }} · {{ .Genre }}</span>
+      <a class="poet-link" href="{{ .AuthorURL }}">{{ .Author }}</a>
+      <span>{{ .Dynasty }} · {{ .Category }}</span>
       {{ range .TagList }}<a class="tag" href="/poems?tag={{ . }}">#{{ . }}</a>{{ end }}
     </div>
   </li>

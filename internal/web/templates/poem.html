@@ -2,8 +2,8 @@
   <header class="poem-page-head">
     <h2 class="poem-page-title">{{ .Poem.Title }}</h2>
     <p class="poem-page-poet">
-      {{ if .Poet.ID }}<a href="/poets/{{ .Poet.ID }}">{{ .Poem.PoetName }}</a>{{ else }}{{ .Poem.PoetName }}{{ end }}
-      <span class="dot">·</span> {{ .Poem.Dynasty }} <span class="dot">·</span> {{ .Poem.Genre }}
+      {{ if .Poem.Author }}<a href="{{ .Poem.AuthorURL }}">{{ .Poem.Author }}</a>{{ else }}{{ .Poem.Author }}{{ end }}
+      <span class="dot">·</span> {{ .Poem.Dynasty }} <span class="dot">·</span> {{ .Poem.Category }}
     </p>
   </header>
 
@@ -11,10 +11,24 @@
     {{ range .Poem.Lines }}<p>{{ . }}</p>{{ end }}
   </div>
 
-  {{ if .Poem.Note }}
+  {{ if .Poem.Translation }}
   <section class="poem-note">
-    <h4>题解</h4>
-    <p>{{ .Poem.Note }}</p>
+    <h4>译文</h4>
+    <p>{{ .Poem.Translation }}</p>
+  </section>
+  {{ end }}
+
+  {{ if .Poem.Annotation }}
+  <section class="poem-note">
+    <h4>注释</h4>
+    <p>{{ .Poem.Annotation }}</p>
+  </section>
+  {{ end }}
+
+  {{ if .Poem.Appreciation }}
+  <section class="poem-note">
+    <h4>赏析</h4>
+    <p>{{ .Poem.Appreciation }}</p>
   </section>
   {{ end }}
 
@@ -31,8 +45,8 @@
 
 {{ if and .Poet.Name .Poet.Intro }}
 <aside class="poet-aside">
-  <h4><a href="/poets/{{ .Poet.ID }}">{{ .Poet.Name }}</a>（{{ .Poet.Dynasty }}）</h4>
+  <h4><a href="{{ .Poet.URL }}">{{ .Poet.Name }}</a>（{{ .Poet.Dynasty }}）</h4>
   <p>{{ .Poet.Intro }}</p>
-  <a class="more" href="/poets/{{ .Poet.ID }}">查看其全部作品 →</a>
+  <a class="more" href="{{ .Poet.URL }}">查看其全部作品 →</a>
 </aside>
 {{ end }}

@@ -1,0 +1,24 @@
+[Unit]
+Description=诗词雅集 (shici)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 按实际部署路径与用户调整（例如 /opt/shici、用户 shici）
+User=shici
+Group=shici
+WorkingDirectory=/opt/shici
+# 程序会自动读取 WorkingDirectory/.env；此处再兜底一次，二者取值一致
+EnvironmentFile=-/opt/shici/.env
+ExecStart=/opt/shici/server
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/shici/.tmp /opt/shici/data
+
+[Install]
+WantedBy=multi-user.target

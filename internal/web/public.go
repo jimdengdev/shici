@@ -27,7 +27,7 @@ func Register(app *iris.Application, st *store.Store) {
 	app.Get("/poems", listPoems(st))
 	app.Get("/poems/{id:int64}", poemDetail(st))
 	app.Get("/poets", listPoets(st))
-	app.Get("/poets/{id:int64}", poetDetail(st))
+	app.Get("/poets/{name:string}", poetDetail(st))
 	app.Get("/random", random(st))
 	app.Get("/about", about)
 
@@ -35,7 +35,7 @@ func Register(app *iris.Application, st *store.Store) {
 	app.Get("/api/poems", apiListPoems(st))
 	app.Get("/api/poems/{id:int64}", apiPoem(st))
 	app.Get("/api/poets", apiListPoets(st))
-	app.Get("/api/poets/{id:int64}", apiPoet(st))
+	app.Get("/api/poets/{name:string}", apiPoet(st))
 	app.Get("/api/search", apiListPoems(st)) // /api/search?q=... 别名
 }
 
@@ -56,7 +56,7 @@ func home(st *store.Store) iris.Handler {
 		if err != nil {
 			daily = model.Poem{}
 		}
-		featured, _, _ := st.ListPoems(store.Filter{Page: 1, PageSize: 8})
+		featured := st.FeaturedPoems(8)
 		stats, _ := st.Stats()
 		render(ctx, st, "index.html", iris.Map{
 			"Title":    "首页",
@@ -94,7 +94,7 @@ func poemDetail(st *store.Store) iris.Handler {
 			notFound(ctx, st)
 			return
 		}
-		poet, _ := st.GetPoet(m.PoetID)
+		poet, _ := st.GetPoet(m.Author)
 		prev, next := st.PrevNext(m.ID)
 		render(ctx, st, "poem.html", iris.Map{
 			"Title": m.Title,
@@ -142,13 +142,13 @@ func listPoets(st *store.Store) iris.Handler {
 
 func poetDetail(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		id := ctx.Params().GetInt64Default("id", 0)
-		p, err := st.GetPoet(id)
+		name, _ := url.PathUnescape(ctx.Params().Get("name"))
+		p, err := st.GetPoet(name)
 		if err != nil {
 			notFound(ctx, st)
 			return
 		}
-		poems, _ := st.PoemsByPoet(p.ID)
+		poems, _ := st.PoemsByPoet(p.Name)
 		render(ctx, st, "poet.html", iris.Map{
 			"Title": p.Name,
 			"Poet":  p,
@@ -190,7 +190,7 @@ func apiListPoems(st *store.Store) iris.Handler {
 			"items": list, "total": total,
 			"page": f.Page, "page_size": f.PageSize,
 			"keyword": f.Keyword, "poet": f.Poet,
-			"dynasty": f.Dynasty, "genre": f.Genre,
+			"dynasty": f.Dynasty, "category": f.Genre,
 		})
 	}
 }
@@ -221,14 +221,14 @@ func apiListPoets(st *store.Store) iris.Handler {
 
 func apiPoet(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		id := ctx.Params().GetInt64Default("id", 0)
-		p, err := st.GetPoet(id)
+		name, _ := url.PathUnescape(ctx.Params().Get("name"))
+		p, err := st.GetPoet(name)
 		if err != nil {
 			ctx.StatusCode(iris.StatusNotFound)
 			ctx.JSON(iris.Map{"error": "诗人不存在"})
 			return
 		}
-		poems, _ := st.PoemsByPoet(id)
+		poems, _ := st.PoemsByPoet(p.Name)
 		ctx.JSON(iris.Map{"item": p, "poems": poems})
 	}
 }
@@ -240,13 +240,17 @@ func filterFrom(ctx iris.Context) store.Filter {
 	if page < 1 {
 		page = 1
 	}
+	genre := ctx.URLParam("genre") // 兼容 category 写法
+	if genre == "" {
+		genre = ctx.URLParam("category")
+	}
 	return store.Filter{
 		Keyword:  ctx.URLParam("keyword"),
-		Poet:    ctx.URLParam("poet"),
-		Dynasty: ctx.URLParam("dynasty"),
-		Genre:   ctx.URLParam("genre"),
-		Tag:     ctx.URLParam("tag"),
-		Page:    page,
+		Poet:     ctx.URLParam("poet"),
+		Dynasty:  ctx.URLParam("dynasty"),
+		Genre:    genre,
+		Tag:      ctx.URLParam("tag"),
+		Page:     page,
 		PageSize: PageSize,
 	}
 }

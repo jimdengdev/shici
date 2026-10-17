@@ -1,17 +1,20 @@
 <div class="section-head">
-  <h2>{{ if .Poet.ID }}编辑诗人{{ else }}新增诗人{{ end }}</h2>
+  <h2>编辑诗人</h2>
   <a class="btn-ghost" href="/admin/poets">← 返回列表</a>
 </div>
 
 {{ if .Error }}<p class="form-error">{{ .Error }}</p>{{ end }}
 
+<p class="muted">诗人由作品的「作者」字段聚合而来，保存后会批量更新其名下 {{ .Poet.PoemCount }} 首作品的作者与朝代。</p>
+
 <form class="admin-form" action="{{ .Action }}" method="post">
-  {{ if .Poet.ID }}<input type="hidden" name="id" value="{{ .Poet.ID }}">{{ end }}
   <div class="form-row">
-    <label>姓名 <input type="text" name="name" value="{{ .Poet.Name }}" required></label>
-    <label>朝代 <input type="text" name="dynasty" value="{{ .Poet.Dynasty }}" placeholder="如：唐"></label>
+    <label>姓名 <input type="text" name="name" value="{{ .Poet.Name }}" maxlength="60" required></label>
+    <label>朝代 <input type="text" name="dynasty" value="{{ .Poet.Dynasty }}" maxlength="24" placeholder="如：唐"></label>
   </div>
-  <label>小传 <textarea name="intro" rows="5">{{ .Poet.Intro }}</textarea></label>
+  <label>小传（只读，取自内置诗人小传）
+    <textarea name="intro" rows="5" readonly>{{ .Poet.Intro }}</textarea>
+  </label>
   <div class="form-actions">
     <button type="submit" class="btn-primary">保 存</button>
     <a class="btn-ghost" href="/admin/poets">取消</a>

@@ -2,13 +2,13 @@
   <p class="hero-kicker">今日诗词</p>
   <h2 class="hero-title"><a href="/poems/{{ .Daily.ID }}">{{ .Daily.Title }}</a></h2>
   <p class="hero-poet">
-    {{ if .Daily.PoetID }}<a href="/poets/{{ .Daily.PoetID }}">{{ .Daily.PoetName }}</a>{{ else }}{{ .Daily.PoetName }}{{ end }}
-    <span class="dot">·</span> {{ .Daily.Dynasty }} <span class="dot">·</span> {{ .Daily.Genre }}
+    {{ if .Daily.Author }}<a href="{{ .Daily.AuthorURL }}">{{ .Daily.Author }}</a>{{ else }}{{ .Daily.Author }}{{ end }}
+    <span class="dot">·</span> {{ .Daily.Dynasty }} <span class="dot">·</span> {{ .Daily.Category }}
   </p>
   <div class="hero-lines">
     {{ range .Daily.Lines }}<p>{{ . }}</p>{{ end }}
   </div>
-  {{ if .Daily.Note }}<blockquote class="hero-note">{{ .Daily.Note }}</blockquote>{{ end }}
+  {{ if .Daily.Appreciation }}<blockquote class="hero-note">{{ .Daily.Brief 80 }}</blockquote>{{ end }}
 </section>
 
 <section class="stats-row">
@@ -26,7 +26,7 @@
     {{ range .Featured }}
     <li class="poem-card">
       <h4><a href="/poems/{{ .ID }}">{{ .Title }}</a></h4>
-      <p class="card-poet"><a href="/poets/{{ .PoetID }}">{{ .PoetName }}</a> · {{ .Dynasty }}</p>
+      <p class="card-poet"><a href="{{ .AuthorURL }}">{{ .Author }}</a> · {{ .Dynasty }}</p>
       <p class="card-excerpt">{{ .Excerpt }}</p>
     </li>
     {{ end }}

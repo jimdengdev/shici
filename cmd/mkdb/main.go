@@ -1,7 +1,7 @@
-// mkdb — 在 MySQL 服务器上创建 shici 数据库（utf8mb4）。
+// mkdb — 在 MySQL 服务器上创建诗词库（utf8mb4，默认 poetry_charity）。
 // 用法（服务端 DSN 不带库名）：
 //
-//	MYSQL_SERVER_DSN='root:pass@tcp(127.0.0.1:3306)/' MYSQL_DATABASE=shici go run ./cmd/mkdb
+//	MYSQL_SERVER_DSN='root:pass@tcp(127.0.0.1:3306)/' MYSQL_DATABASE=poetry_charity go run ./cmd/mkdb
 package main
 
 import (
@@ -22,7 +22,7 @@ func envOr(key, def string) string {
 
 func main() {
 	serverDSN := envOr("MYSQL_SERVER_DSN", "root:pass@tcp(127.0.0.1:3306)/")
-	dbName := envOr("MYSQL_DATABASE", "shici")
+	dbName := envOr("MYSQL_DATABASE", "poetry_charity")
 
 	db, err := sql.Open("mysql", serverDSN)
 	if err != nil {

@@ -1,7 +1,7 @@
 <article class="poet-page">
   <header class="poet-page-head">
     <h2>{{ .Poet.Name }}</h2>
-    <p class="muted">{{ .Poet.Dynasty }} · 收录作品 {{ .Poet.PoemCount }} 首</p>
+    <p class="muted">{{ .Poet.Dynasty }} · 收录作品 {{ .Poet.PoemCount }} 首{{ if ge .Poet.PoemCount 200 }}（显示前 200 首）{{ end }}</p>
   </header>
   {{ if .Poet.Intro }}
   <section class="poet-intro">
@@ -17,7 +17,7 @@
         <h3><a href="/poems/{{ .ID }}">{{ .Title }}</a></h3>
         <p class="poem-item-excerpt">{{ .Excerpt }}</p>
       </div>
-      <div class="poem-item-meta"><span>{{ .Genre }}</span></div>
+      <div class="poem-item-meta"><span>{{ .Category }}</span></div>
     </li>
     {{ end }}
   </ul>

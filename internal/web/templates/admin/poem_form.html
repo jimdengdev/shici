@@ -7,24 +7,35 @@
 
 <form class="admin-form" action="{{ .Action }}" method="post">
   {{ if .Poem.ID }}<input type="hidden" name="id" value="{{ .Poem.ID }}">{{ end }}
-  <label>标题 <input type="text" name="title" value="{{ .Poem.Title }}" required></label>
+  <label>标题 <input type="text" name="title" value="{{ .Poem.Title }}" maxlength="100" required></label>
   <div class="form-row">
-    <label>诗人
-      <select name="poet_id" required>
-        {{ range .Poets }}
-        <option value="{{ .ID }}" {{ if eq $.Poem.PoetID .ID }}selected{{ end }}>{{ .Name }}（{{ .Dynasty }}）</option>
-        {{ end }}
-      </select>
-    </label>
-    <label>体裁 <input type="text" name="genre" value="{{ .Poem.Genre }}" placeholder="如：七言绝句 / 词"></label>
+    <label>作者 <input type="text" name="author" value="{{ .Poem.Author }}" list="poet-options" maxlength="60" required></label>
+    <label>朝代 <input type="text" name="dynasty" value="{{ .Poem.Dynasty }}" list="dynasty-options" maxlength="24"></label>
+    <label>体裁 <input type="text" name="category" value="{{ .Poem.Category }}" list="category-options" maxlength="24" placeholder="如：唐诗 / 宋词"></label>
   </div>
   <label>正文（<b>每行一句</b>，可含标点）
     <textarea name="content" rows="10" required>{{ .Poem.Content }}</textarea>
   </label>
+  <label>译文（可选）<textarea name="translation" rows="3">{{ .Poem.Translation }}</textarea></label>
+  <label>注释（可选）<textarea name="annotation" rows="3">{{ .Poem.Annotation }}</textarea></label>
+  <label>赏析（可选）<textarea name="appreciation" rows="4">{{ .Poem.Appreciation }}</textarea></label>
   <label>标签（逗号分隔）<input type="text" name="tags" value="{{ .Poem.Tags }}" placeholder="如：思乡,月亮"></label>
-  <label>题解 / 译文（可选）<textarea name="note" rows="3">{{ .Poem.Note }}</textarea></label>
+  <div class="form-row">
+    <label>状态
+      <select name="status">
+        <option value="published" {{ if eq .Poem.Status "published" }}selected{{ end }}>已发布</option>
+        <option value="draft" {{ if eq .Poem.Status "draft" }}selected{{ end }}>草稿</option>
+        <option value="archived" {{ if eq .Poem.Status "archived" }}selected{{ end }}>已归档</option>
+      </select>
+    </label>
+    <label class="checkbox"><input type="checkbox" name="featured" value="1" {{ if .Poem.Featured }}checked{{ end }}> 设为精选</label>
+  </div>
   <div class="form-actions">
     <button type="submit" class="btn-primary">保 存</button>
     <a class="btn-ghost" href="/admin/poems">取消</a>
   </div>
 </form>
+
+<datalist id="poet-options">{{ range .Poets }}<option value="{{ .Name }}">{{ end }}</datalist>
+<datalist id="dynasty-options">{{ range .Dynasties }}<option value="{{ . }}">{{ end }}</datalist>
+<datalist id="category-options">{{ range .Genres }}<option value="{{ . }}">{{ end }}</datalist>

@@ -2,7 +2,7 @@
 
 <form class="filter-panel" action="/poets" method="get">
   <div class="filter-fields">
-    <label>关键词 <input type="search" name="keyword" value="{{ .Keyword }}" placeholder="姓名 / 小传"></label>
+    <label>关键词 <input type="search" name="keyword" value="{{ .Keyword }}" placeholder="姓名"></label>
     <label>朝代
       <select name="dynasty">
         <option value="">全部</option>
@@ -14,7 +14,7 @@
   </div>
 </form>
 
-<p class="result-info">共 {{ .Total }} 位 · 亦可在<a href="/poems">诗词检索</a>中按诗人筛选</p>
+<p class="result-info">共 {{ .Total }} 位 · 按作品数排序 · 亦可在<a href="/poems">诗词检索</a>中按诗人筛选</p>
 
 {{ range .Order }}
 <section class="dynasty-group">
@@ -22,7 +22,7 @@
   <ul class="poet-grid">
     {{ range index $.Groups . }}
     <li class="poet-card">
-      <h4><a href="/poets/{{ .ID }}">{{ .Name }}</a> <span class="muted">{{ .PoemCount }} 首</span></h4>
+      <h4><a href="{{ .URL }}">{{ .Name }}</a> <span class="muted">{{ .PoemCount }} 首</span></h4>
       <p>{{ if .Intro }}{{ .Intro }}{{ else }}暂无简介{{ end }}</p>
     </li>
     {{ end }}

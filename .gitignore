@@ -1,6 +1,7 @@
 /server
 /.tmp/
 /.env
+/.idea/
 /data/*.db
 /data/*.db-journal
 /data/*.db-shm

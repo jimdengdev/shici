@@ -1,35 +1,35 @@
 <div class="section-head">
-  <h2>诗人管理 <span class="muted">共 {{ .Total }} 位</span></h2>
-  <a class="btn-primary" href="/admin/poets/new">+ 新增诗人</a>
+  <h2>诗人管理 <span class="muted">共 {{ .Total }} 位（按作品数排序，最多显示 300 位）</span></h2>
 </div>
+
+<p class="muted">诗人由作品的「作者」字段自动聚合，新增作品时作者名即可生成诗人。</p>
 
 <form class="filter-panel" action="/admin/poets" method="get">
   <div class="filter-fields">
-    <label>关键词 <input type="search" name="keyword" value="{{ .Keyword }}" placeholder="姓名 / 小传"></label>
+    <label>关键词 <input type="search" name="keyword" value="{{ .Keyword }}" placeholder="姓名"></label>
     <button type="submit" class="btn-primary">筛选</button>
     <a class="btn-ghost" href="/admin/poets">重置</a>
   </div>
 </form>
 
 <table class="admin-table">
-  <thead><tr><th>ID</th><th>姓名</th><th>朝代</th><th>作品数</th><th>简介</th><th>操作</th></tr></thead>
+  <thead><tr><th>姓名</th><th>朝代</th><th>作品数</th><th>小传</th><th>操作</th></tr></thead>
   <tbody>
     {{ range .Poets }}
     <tr>
-      <td>{{ .ID }}</td>
-      <td>{{ .Name }}</td>
+      <td><a href="{{ .URL }}" target="_blank">{{ .Name }}</a></td>
       <td>{{ .Dynasty }}</td>
       <td>{{ .PoemCount }}</td>
-      <td class="intro-cell">{{ .Intro }}</td>
+      <td class="intro-cell">{{ if .Intro }}{{ .Intro }}{{ else }}<span class="muted">暂无</span>{{ end }}</td>
       <td class="row-actions">
-        <a href="/admin/poets/{{ .ID }}/edit">编辑</a>
-        <form action="/admin/poets/{{ .ID }}/delete" method="post" onsubmit="return confirm('确认删除诗人「{{ .Name }}」？其名下 {{ .PoemCount }} 首作品将一并删除。')">
+        <a href="{{ .EditURL }}">编辑</a>
+        <form action="{{ .DeleteURL }}" method="post" onsubmit="return confirm('确认删除诗人「{{ .Name }}」？其名下 {{ .PoemCount }} 首作品将一并置为归档状态（数据保留）。')">
           <button type="submit" class="danger">删除</button>
         </form>
       </td>
     </tr>
     {{ else }}
-    <tr><td colspan="6" class="muted">无匹配结果</td></tr>
+    <tr><td colspan="5" class="muted">无匹配结果</td></tr>
     {{ end }}
   </tbody>
 </table>

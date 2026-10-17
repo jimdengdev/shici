@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kataras/iris/v12"
@@ -23,6 +24,9 @@ const AdminPageSize = 20
 var sess = sessions.New(sessions.Config{
 	Cookie:  "shici_admin",
 	Expires: 12 * time.Hour,
+	// 反向代理 / 直接用 IP 访问时不要把 Cookie 的 Domain 固定为请求子域，
+	// 否则浏览器会因 Domain 与当前主机不一致而丢弃会话 Cookie。
+	DisableSubdomainPersistence: true,
 })
 
 // Register 注册后台路由（/admin/**）。
@@ -44,13 +48,12 @@ func Register(app *iris.Application, st *store.Store) {
 	poems.Post("/{id:int64}/edit", poemUpdate(st))
 	poems.Post("/{id:int64}/delete", poemDelete(st))
 
+	// 诗人由 poems.author 聚合派生，以姓名作为标识；不支持新增（随作品产生）
 	poets := p.Party("/poets")
 	poets.Get("/", poetList(st))
-	poets.Get("/new", poetFormNew)
-	poets.Post("/new", poetCreate(st))
-	poets.Get("/{id:int64}/edit", poetFormEdit(st))
-	poets.Post("/{id:int64}/edit", poetUpdate(st))
-	poets.Post("/{id:int64}/delete", poetDelete(st))
+	poets.Get("/{name:string}/edit", poetFormEdit(st))
+	poets.Post("/{name:string}/edit", poetUpdate(st))
+	poets.Post("/{name:string}/delete", poetDelete(st))
 }
 
 // ── 鉴权 ───────────────────────────────────────────────
@@ -140,8 +143,8 @@ func poemList(st *store.Store) iris.Handler {
 		ctx.View("admin/poems.html", iris.Map{
 			"Title": "诗词管理", "Poems": list, "Total": total,
 			"Filter": f, "Page": page,
-			"Pages":   (total + AdminPageSize - 1) / AdminPageSize,
-			"Genres":  st.Genres(),
+			"Pages":  (total + AdminPageSize - 1) / AdminPageSize,
+			"Genres": st.Genres(),
 			"PageURLs": adminPageURLs(ctx, "/admin/poems", page,
 				(total+AdminPageSize-1)/AdminPageSize),
 		})
@@ -150,40 +153,41 @@ func poemList(st *store.Store) iris.Handler {
 
 func poemFormData(st *store.Store, m model.Poem, action string, errMsg string) iris.Map {
 	return iris.Map{
-		"Title":  "编辑诗词",
-		"Poem":   m,
-		"Action": action,
-		"Poets":  st.PoetOptions(),
-		"Error":  errMsg,
+		"Title":     "编辑诗词",
+		"Poem":      m,
+		"Action":    action,
+		"Poets":     st.PoetOptions(),
+		"Dynasties": st.Dynasties(),
+		"Genres":    st.Genres(),
+		"Error":     errMsg,
 	}
 }
 
 func poemFormNew(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		ctx.View("admin/poem_form.html", poemFormData(st, model.Poem{PoetID: firstPoetID(st)}, "/admin/poems/new", ""))
+		ctx.View("admin/poem_form.html",
+			poemFormData(st, model.Poem{Category: "古诗", Status: "published"}, "/admin/poems/new", ""))
 	}
-}
-
-func firstPoetID(st *store.Store) int64 {
-	if poets := st.PoetOptions(); len(poets) > 0 {
-		return poets[0].ID
-	}
-	return 0
 }
 
 func poemFromForm(ctx iris.Context) (m model.Poem) {
 	m.ID = store.AtoiID(ctx.FormValue("id"))
 	m.Title = ctx.FormValue("title")
-	m.PoetID = store.AtoiID(ctx.FormValue("poet_id"))
-	m.Genre = ctx.FormValue("genre")
+	m.Author = ctx.FormValue("author")
+	m.Dynasty = ctx.FormValue("dynasty")
+	m.Category = ctx.FormValue("category")
 	m.Content = ctx.FormValue("content")
+	m.Translation = ctx.FormValue("translation")
+	m.Annotation = ctx.FormValue("annotation")
+	m.Appreciation = ctx.FormValue("appreciation")
 	m.Tags = ctx.FormValue("tags")
-	m.Note = ctx.FormValue("note")
+	m.Featured = ctx.FormValue("featured") == "1"
+	m.Status = ctx.FormValue("status")
 	return
 }
 
 func poemValid(m model.Poem) bool {
-	return m.Title != "" && m.PoetID > 0 && m.Content != ""
+	return m.Title != "" && m.Author != "" && m.Content != ""
 }
 
 func poemCreate(st *store.Store) iris.Handler {
@@ -241,6 +245,8 @@ func poemDelete(st *store.Store) iris.Handler {
 }
 
 // ── 诗人管理 ───────────────────────────────────────────
+// 诗人由 poems.author/dynasty 聚合派生：不支持新增，编辑即批量改写其作品上的
+// 作者/朝代，删除即删除其全部作品。
 
 func poetList(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
@@ -258,61 +264,36 @@ func poetFormData(p model.Poet, action string, errMsg string) iris.Map {
 	}
 }
 
-func poetFormNew(ctx iris.Context) {
-	ctx.View("admin/poet_form.html", poetFormData(model.Poet{}, "/admin/poets/new", ""))
-}
-
-func poetFromForm(ctx iris.Context) (p model.Poet) {
-	p.ID = store.AtoiID(ctx.FormValue("id"))
-	p.Name = ctx.FormValue("name")
-	p.Dynasty = ctx.FormValue("dynasty")
-	p.Intro = ctx.FormValue("intro")
-	return
-}
-
-func poetValid(p model.Poet) bool { return p.Name != "" }
-
-func poetCreate(st *store.Store) iris.Handler {
-	return func(ctx iris.Context) {
-		p := poetFromForm(ctx)
-		if !poetValid(p) {
-			ctx.View("admin/poet_form.html", poetFormData(p, "/admin/poets/new", "请填写诗人姓名"))
-			return
-		}
-		if _, err := st.CreatePoet(p.Name, p.Dynasty, p.Intro); err != nil {
-			ctx.View("admin/poet_form.html", poetFormData(p, "/admin/poets/new", "保存失败："+err.Error()))
-			return
-		}
-		ctx.Redirect("/admin/poets")
-	}
+// poetName 取 URL 中的诗人姓名（已做路径反转义）。
+func poetName(ctx iris.Context) string {
+	name, _ := url.PathUnescape(ctx.Params().Get("name"))
+	return name
 }
 
 func poetFormEdit(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		id := ctx.Params().GetInt64Default("id", 0)
-		p, err := st.GetPoet(id)
+		p, err := st.GetPoet(poetName(ctx))
 		if err != nil {
 			ctx.Redirect("/admin/poets")
 			return
 		}
-		ctx.View("admin/poet_form.html",
-			poetFormData(p, fmt.Sprintf("/admin/poets/%d/edit", id), ""))
+		ctx.View("admin/poet_form.html", poetFormData(p, p.EditURL(), ""))
 	}
 }
 
 func poetUpdate(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		id := ctx.Params().GetInt64Default("id", 0)
-		p := poetFromForm(ctx)
-		p.ID = id
-		if !poetValid(p) {
-			ctx.View("admin/poet_form.html",
-				poetFormData(p, fmt.Sprintf("/admin/poets/%d/edit", id), "请填写诗人姓名"))
+		oldName := poetName(ctx)
+		name := strings.TrimSpace(ctx.FormValue("name"))
+		dynasty := strings.TrimSpace(ctx.FormValue("dynasty"))
+		if name == "" {
+			cur, _ := st.GetPoet(oldName)
+			ctx.View("admin/poet_form.html", poetFormData(cur, cur.EditURL(), "请填写诗人姓名"))
 			return
 		}
-		if err := st.UpdatePoet(p.ID, p.Name, p.Dynasty, p.Intro); err != nil {
-			ctx.View("admin/poet_form.html",
-				poetFormData(p, fmt.Sprintf("/admin/poets/%d/edit", id), "保存失败："+err.Error()))
+		if err := st.RenamePoet(oldName, name, dynasty); err != nil {
+			cur, _ := st.GetPoet(oldName)
+			ctx.View("admin/poet_form.html", poetFormData(cur, cur.EditURL(), "保存失败："+err.Error()))
 			return
 		}
 		ctx.Redirect("/admin/poets")
@@ -321,7 +302,7 @@ func poetUpdate(st *store.Store) iris.Handler {
 
 func poetDelete(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		st.DeletePoet(ctx.Params().GetInt64Default("id", 0))
+		st.DeletePoet(poetName(ctx))
 		ctx.Redirect("/admin/poets")
 	}
 }

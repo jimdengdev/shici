@@ -1,15 +1,31 @@
-// Package store 基于 SQLite（modernc.org/sqlite，纯 Go 无 CGO）的数据访问层。
-// 首次打开自动建表并灌入种子数据。
+// Package store 数据访问层，直接适配远端 MySQL 库（poetry_charity）的 poems 表结构：
+//
+//	poems(id, title, author, dynasty, category, content,
+//	      translation, annotation, appreciation, tags(JSON), featured,
+//	      view_count, favorite_count, comment_count, status,
+//	      created_by, created_at, updated_at)
+//
+// 库中没有诗人表，诗人由 poems.author/dynasty 聚合派生；诗人小传取自内置
+// data.Poets（未收录的诗人显示为空）。SQLite 作为零依赖的本地开发后端，
+// 使用同一套字段语义（JSON 标签以文本存储）。
+//
+// 关键词检索优先使用 poems 表的 ngram 全文索引 ft_poems_search
+// （title, author, content, translation, annotation），连接时自动探测，
+// 自建库自动补建；索引不可用或关键词短于 ngram 分词长度时降级 LIKE。
 package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql" // MySQL 驱动（纯 Go）
@@ -19,74 +35,111 @@ import (
 	"shici/internal/model"
 )
 
+// DefaultMySQLDatabase 连接串未指定库名时使用的默认库。
+const DefaultMySQLDatabase = "poetry_charity"
+
 const sqliteSchema = `
-CREATE TABLE IF NOT EXISTS poets (
-  id      INTEGER PRIMARY KEY AUTOINCREMENT,
-  name    TEXT NOT NULL UNIQUE,
-  dynasty TEXT NOT NULL DEFAULT '',
-  intro   TEXT NOT NULL DEFAULT ''
-);
 CREATE TABLE IF NOT EXISTS poems (
-  id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  title     TEXT NOT NULL,
-  poet_id   INTEGER NOT NULL REFERENCES poets(id) ON DELETE CASCADE,
-  poet_name TEXT NOT NULL DEFAULT '',
-  dynasty   TEXT NOT NULL DEFAULT '',
-  genre     TEXT NOT NULL DEFAULT '',
-  content   TEXT NOT NULL,
-  tags      TEXT NOT NULL DEFAULT '',
-  note      TEXT NOT NULL DEFAULT '',
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  title          TEXT NOT NULL,
+  author         TEXT NOT NULL,
+  dynasty        TEXT NOT NULL DEFAULT '',
+  category       TEXT NOT NULL DEFAULT '古诗',
+  content        TEXT NOT NULL DEFAULT '',
+  translation    TEXT NOT NULL DEFAULT '',
+  annotation     TEXT NOT NULL DEFAULT '',
+  appreciation   TEXT NOT NULL DEFAULT '',
+  tags           TEXT DEFAULT NULL,
+  featured       INTEGER NOT NULL DEFAULT 0,
+  view_count     INTEGER NOT NULL DEFAULT 0,
+  favorite_count INTEGER NOT NULL DEFAULT 0,
+  comment_count  INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL DEFAULT 'published',
+  created_by     INTEGER DEFAULT NULL,
+  created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_poems_title ON poems(title);
-CREATE INDEX IF NOT EXISTS idx_poems_poet_name ON poems(poet_name);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_poems_dedup ON poems(dynasty, title, author);
 CREATE INDEX IF NOT EXISTS idx_poems_dynasty ON poems(dynasty);
+CREATE INDEX IF NOT EXISTS idx_poems_category ON poems(category);
+CREATE INDEX IF NOT EXISTS idx_poems_status ON poems(status);
+CREATE INDEX IF NOT EXISTS idx_poems_featured ON poems(featured, created_at);
+CREATE INDEX IF NOT EXISTS idx_poems_author ON poems(author);
 `
 
 const mysqlSchema = `
-CREATE TABLE IF NOT EXISTS poets (
-  id      INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  name    VARCHAR(64) NOT NULL UNIQUE,
-  dynasty VARCHAR(32) NOT NULL DEFAULT '',
-  intro   TEXT NOT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS poems (
-  id        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  title     VARCHAR(255) NOT NULL,
-  poet_id   INT UNSIGNED NOT NULL,
-  poet_name VARCHAR(64) NOT NULL DEFAULT '',
-  dynasty   VARCHAR(32) NOT NULL DEFAULT '',
-  genre     VARCHAR(32) NOT NULL DEFAULT '',
-  content   MEDIUMTEXT NOT NULL,
-  tags      VARCHAR(255) NOT NULL DEFAULT '',
-  note      TEXT NOT NULL,
-  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT fk_poems_poet FOREIGN KEY (poet_id) REFERENCES poets(id) ON DELETE CASCADE,
-  KEY idx_poems_title (title),
-  KEY idx_poems_poet_name (poet_name),
-  KEY idx_poems_dynasty (dynasty)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  title          VARCHAR(100) NOT NULL COMMENT '标题',
+  author         VARCHAR(60) NOT NULL COMMENT '作者',
+  dynasty        VARCHAR(24) NOT NULL COMMENT '朝代',
+  category       VARCHAR(24) NOT NULL DEFAULT '古诗' COMMENT '体裁分类',
+  content        TEXT NOT NULL COMMENT '正文',
+  translation    TEXT NOT NULL COMMENT '译文',
+  annotation     TEXT NOT NULL COMMENT '注释',
+  appreciation   TEXT NOT NULL COMMENT '赏析',
+  tags           JSON DEFAULT NULL COMMENT '标签数组',
+  featured       TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否精选',
+  view_count     BIGINT NOT NULL DEFAULT 0 COMMENT '阅读量',
+  favorite_count INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '收藏数',
+  comment_count  INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '评论数',
+  status         ENUM('draft','published','archived') NOT NULL DEFAULT 'published' COMMENT '状态',
+  created_by     BIGINT UNSIGNED DEFAULT NULL COMMENT '创建者',
+  created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_poems_dedup (dynasty, title, author),
+  KEY idx_poems_dynasty (dynasty),
+  KEY idx_poems_category (category),
+  KEY idx_poems_status (status),
+  KEY idx_poems_featured (featured, created_at),
+  KEY idx_poems_author (author)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='古诗词表'
 `
 
-// dialect 方言差异：DDL、随机函数、连接池策略。
+// dialect 方言差异：驱动、DDL、连接池与旧表兼容策略。
 type dialect struct {
-	driver  string
-	ddl     string
-	randFn  string // SQLite: RANDOM() / MySQL: RAND()
-	maxOpen int    // 连接池上限（SQLite 串行化防锁冲突）
+	driver        string
+	ddl           string
+	maxOpen       int
+	tableExists   string // 判断 poems 表是否存在的查询（返回 1 行即存在）
+	dropLegacyDDL bool   // 旧版自有 schema（无 author 列）是否可直接丢弃重建
+	fulltextIndex string // 全文索引名（空 = 该方言不支持全文检索，走 LIKE）
 }
 
 var (
-	dialectSQLite = dialect{driver: "sqlite", ddl: sqliteSchema, randFn: "RANDOM()", maxOpen: 1}
-	dialectMySQL  = dialect{driver: "mysql", ddl: mysqlSchema, randFn: "RAND()", maxOpen: 10}
+	dialectSQLite = dialect{
+		driver: "sqlite",
+		ddl:    sqliteSchema,
+		// SQLite 串行化写入，避免 database is locked
+		maxOpen:     1,
+		tableExists: `SELECT 1 FROM sqlite_master WHERE type='table' AND name='poems'`,
+		// 本地库由种子数据重建，旧结构可直接丢弃
+		dropLegacyDDL: true,
+	}
+	dialectMySQL = dialect{
+		driver:        "mysql",
+		ddl:           mysqlSchema,
+		maxOpen:       10,
+		tableExists:   `SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'poems'`,
+		dropLegacyDDL: false,
+		// 与远端 poems 表一致：ngram 全文索引（中文分词）
+		fulltextIndex: "ft_poems_search",
+	}
 )
+
+// publishedCond 站点展示的有效记录：published 为在架，archived 视为已删除（软删除）。
+const publishedCond = `p.status = 'published'`
+
+// 全文索引列（与 ft_poems_search 的列集合严格一致，MySQL 要求）。
+const fulltextCols = `title, author, content, translation, annotation`
 
 // Filter 诗词检索过滤条件。
 type Filter struct {
-	Keyword  string // 关键词：匹配标题 / 正文 / 诗人 / 标签
-	Poet     string // 诗人（模糊匹配）
+	Keyword  string // 关键词：走 ngram 全文索引（MySQL）/ LIKE（SQLite）
+	Poet     string // 作者（模糊匹配）
 	Dynasty  string
-	Genre    string
+	Genre    string // 体裁（对应 category 列）
 	Tag      string
 	Page     int
 	PageSize int
@@ -94,8 +147,86 @@ type Filter struct {
 
 // Store 数据存储。
 type Store struct {
-	db *sql.DB
-	d  dialect
+	db       *sql.DB
+	d        dialect
+	fulltext bool // 是否可用 ngram 全文索引
+
+	// 元数据/统计缓存：DISTINCT 与 COUNT(*) 在 34 万行上开销较大，短 TTL 缓存
+	metaMu   sync.Mutex
+	meta     map[string]memoEntry
+	statsMu  sync.Mutex
+	statsVal Stats
+	statsAt  time.Time
+}
+
+type memoEntry struct {
+	val []string
+	at  time.Time
+}
+
+const (
+	metaTTL  = 10 * time.Minute // 朝代/体裁列表
+	statsTTL = time.Minute      // 收录统计
+)
+
+// ── 连接 ───────────────────────────────────────────────
+
+// NormalizeDSN 把 mysql:// 形式的连接串转成 go-sql-driver 的 DSN，
+// 也接受原生 DSN；未指定库名时补 defaultDB。
+func NormalizeDSN(raw, defaultDB string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("MySQL 连接串为空")
+	}
+	if strings.HasPrefix(raw, "mysql://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return "", fmt.Errorf("解析 MySQL 连接串失败: %w", err)
+		}
+		cfg := mysql.NewConfig()
+		cfg.Net = "tcp"
+		cfg.Addr = u.Host
+		if u.User != nil {
+			cfg.User = u.User.Username()
+			if p, ok := u.User.Password(); ok {
+				cfg.Passwd = p
+			}
+		}
+		cfg.DBName = strings.TrimPrefix(u.Path, "/")
+		cfg.ParseTime = true
+		cfg.Loc = time.Local
+		cfg.Params = map[string]string{"charset": "utf8mb4"}
+		for k, vs := range u.Query() {
+			switch strings.ToLower(k) {
+			case "parsetime", "loc":
+				continue
+			case "charset":
+				cfg.Params["charset"] = vs[0]
+			default:
+				cfg.Params[k] = vs[0]
+			}
+		}
+		if cfg.DBName == "" {
+			cfg.DBName = defaultDB
+		}
+		return cfg.FormatDSN(), nil
+	}
+	// 原生 DSN
+	cfg, err := mysql.ParseDSN(raw)
+	if err != nil {
+		return "", fmt.Errorf("解析 MySQL DSN 失败: %w", err)
+	}
+	if cfg.DBName == "" {
+		cfg.DBName = defaultDB
+	}
+	cfg.ParseTime = true
+	if cfg.Params == nil {
+		cfg.Params = map[string]string{}
+	}
+	if cfg.Params["charset"] == "" {
+		cfg.Params["charset"] = "utf8mb4"
+	}
+	return cfg.FormatDSN(), nil
 }
 
 // Open 打开（或创建）SQLite 数据库；库为空时灌入种子数据。
@@ -105,23 +236,26 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	// 启用外键级联删除与忙等待（modernc/sqlite 连接级 PRAGMA）
-	dsn := fmt.Sprintf("%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
+	// 启用外键与忙等待（modernc/sqlite 连接级 PRAGMA）
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)", path)
 	return open(dialectSQLite, dsn)
 }
 
-// OpenMySQL 打开 MySQL 数据库（需 utf8mb4 + parseTime）；库不存在时自动创建（utf8mb4）。
-// DSN 示例：user:pass@tcp(127.0.0.1:3306)/shici?charset=utf8mb4&parseTime=true&loc=Local
+// OpenMySQL 打开 MySQL 数据库（utf8mb4）。支持 mysql://user:pass@host:port/db?… 形式。
 func OpenMySQL(dsn string) (*Store, error) {
-	s, err := open(dialectMySQL, dsn)
+	normalized, err := NormalizeDSN(dsn, DefaultMySQLDatabase)
+	if err != nil {
+		return nil, err
+	}
+	s, err := open(dialectMySQL, normalized)
 	if err == nil {
 		return s, nil
 	}
 	// 库不存在（MySQL 错误码 1049）→ 自动建库后重试
 	var myErr *mysql.MySQLError
 	if errors.As(err, &myErr) && myErr.Number == 1049 {
-		if createErr := createMySQLDatabase(dsn); createErr == nil {
-			return open(dialectMySQL, dsn)
+		if createErr := createMySQLDatabase(normalized); createErr == nil {
+			return open(dialectMySQL, normalized)
 		}
 	}
 	return nil, err
@@ -154,20 +288,42 @@ func open(d dialect, dsn string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(d.maxOpen)
+	db.SetMaxIdleConns(d.maxOpen)
 	if d.maxOpen > 1 {
 		db.SetConnMaxLifetime(time.Hour) // 连接池防陈旧连接（MySQL）
 	}
-	// MySQL 驱动默认不支持单次 Exec 多语句，按语句逐条建表（双方言通用）
-	for _, stmt := range strings.Split(d.ddl, ";") {
-		if strings.TrimSpace(stmt) == "" {
-			continue
-		}
-		if _, err := db.Exec(stmt); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("建表失败: %w", err)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// 旧版本自有 schema（poems 无 author 列）处理；返回表是否已存在且结构匹配
+	exists, err := ensureCompatible(db, d)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if !exists {
+		// 表不存在才建表：只读账号（无 CREATE 权限）连接已有库时不触发 DDL。
+		// MySQL 驱动默认不支持单次 Exec 多语句，按语句逐条执行（双方言通用）
+		for _, stmt := range strings.Split(d.ddl, ";") {
+			if strings.TrimSpace(stmt) == "" {
+				continue
+			}
+			if _, err := db.Exec(stmt); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("建表失败: %w", err)
+			}
 		}
 	}
 	s := &Store{db: db, d: d}
+	s.fulltext = s.detectFulltext()
+	if !s.fulltext && d.fulltextIndex != "" {
+		// 自建库补齐 ngram 全文索引；不支持时静默降级为 LIKE
+		if _, err := db.Exec(`ALTER TABLE poems ADD FULLTEXT KEY ` + d.fulltextIndex +
+			` (` + fulltextCols + `) WITH PARSER ngram`); err == nil {
+			s.fulltext = s.detectFulltext()
+		}
+	}
 	if err := s.seedIfEmpty(); err != nil {
 		db.Close()
 		return nil, err
@@ -175,9 +331,94 @@ func open(d dialect, dsn string) (*Store, error) {
 	return s, nil
 }
 
+// detectFulltext 探测 ngram 全文索引是否可用（索引存在且列集合匹配）。
+func (s *Store) detectFulltext() bool {
+	if s.d.fulltextIndex == "" {
+		return false
+	}
+	rows, err := s.db.Query(`SELECT id FROM poems WHERE MATCH(` + fulltextCols +
+		`) AGAINST('诗词' IN BOOLEAN MODE) LIMIT 1`)
+	if err != nil {
+		return false
+	}
+	rows.Close()
+	return true
+}
+
+// ensureCompatible 确认 poems 表是目标结构，返回表是否已存在且可用。
+// 表已存在时无需再执行建表 DDL（只读账号没有 CREATE 权限）。
+func ensureCompatible(db *sql.DB, d dialect) (bool, error) {
+	var one int
+	err := db.QueryRow(d.tableExists).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil // 表还不存在，需要建表
+	}
+	if err != nil {
+		return false, fmt.Errorf("检查 poems 表失败: %w", err)
+	}
+	var author string
+	if err := db.QueryRow(`SELECT author FROM poems LIMIT 1`).Scan(&author); err == nil ||
+		errors.Is(err, sql.ErrNoRows) {
+		return true, nil // 结构匹配（空表也算）
+	}
+	if !d.dropLegacyDDL {
+		return false, errors.New("poems 表结构不兼容：缺少 author 列，请确认连接的是诗词库")
+	}
+	if _, err := db.Exec(`DROP TABLE poems`); err != nil {
+		return false, fmt.Errorf("重建旧版 poems 表失败: %w", err)
+	}
+	return false, nil // 已丢弃旧表，需重新建表
+}
+
+// ReadOnly 判断当前数据库账号是否缺少写入权限（MySQL 只读账号）。
+// 用于启动提示：只读账号下后台的新增/修改/删除会被数据库拒绝。
+func (s *Store) ReadOnly() bool {
+	if s.d.driver != "mysql" {
+		return false
+	}
+	// GRANTEE 形如 'poetry_user'@'%'
+	const grantee = `CONCAT("'", SUBSTRING_INDEX(CURRENT_USER(),'@',1), "'@'", SUBSTRING_INDEX(CURRENT_USER(),'@',-1), "'")`
+	q := `SELECT COUNT(*) FROM (
+	        SELECT PRIVILEGE_TYPE FROM information_schema.user_privileges WHERE GRANTEE=` + grantee + `
+	        UNION ALL
+	        SELECT PRIVILEGE_TYPE FROM information_schema.schema_privileges
+	          WHERE TABLE_SCHEMA=DATABASE() AND GRANTEE=` + grantee + `
+	        UNION ALL
+	        SELECT PRIVILEGE_TYPE FROM information_schema.table_privileges
+	          WHERE TABLE_SCHEMA=DATABASE() AND GRANTEE=` + grantee + `
+	      ) t
+	      WHERE PRIVILEGE_TYPE IN ('INSERT','UPDATE','DELETE','ALL PRIVILEGES')`
+	var n int
+	if err := s.db.QueryRow(q).Scan(&n); err != nil {
+		return false // 查询失败时不阻断启动
+	}
+	return n == 0
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 
+// ── 种子数据（仅空库时写入） ────────────────────────────
+
+var poetIntros = func() map[string]string {
+	m := make(map[string]string, len(data.Poets))
+	for _, p := range data.Poets {
+		m[p.Name] = p.Intro
+	}
+	return m
+}()
+
+var poetDynasty = func() map[string]string {
+	m := make(map[string]string, len(data.Poets))
+	for _, p := range data.Poets {
+		m[p.Name] = p.Dynasty
+	}
+	return m
+}()
+
 func (s *Store) seedIfEmpty() error {
+	if s.ReadOnly() {
+		return nil // 只读账号无法写入种子数据
+	}
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems`).Scan(&n); err != nil {
 		return err
@@ -191,54 +432,125 @@ func (s *Store) seedIfEmpty() error {
 	}
 	defer tx.Rollback()
 
-	poetID := map[string]int64{}
-	dynasty := map[string]string{}
-	for _, p := range data.Poets {
-		res, err := tx.Exec(
-			`INSERT INTO poets(name, dynasty, intro) VALUES(?,?,?)`,
-			p.Name, p.Dynasty, p.Intro)
-		if err != nil {
-			return fmt.Errorf("写入诗人 %s: %w", p.Name, err)
-		}
-		id, _ := res.LastInsertId()
-		poetID[p.Name] = id
-		dynasty[p.Name] = p.Dynasty
-	}
 	for _, m := range data.Poems {
-		pid, ok := poetID[m.Poet]
-		if !ok {
-			return fmt.Errorf("种子诗词 %q 引用了未知诗人 %q", m.Title, m.Poet)
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO poems(title, poet_id, poet_name, dynasty, genre, content, tags, note)
-			 VALUES(?,?,?,?,?,?,?,?)`,
-			m.Title, pid, m.Poet, dynasty[m.Poet], m.Genre, m.Content, m.Tags, m.Note,
-		); err != nil {
+		params := poemParams(model.Poem{
+			Title:        m.Title,
+			Author:       m.Poet,
+			Dynasty:      poetDynasty[m.Poet],
+			Category:     m.Genre,
+			Content:      m.Content,
+			Appreciation: m.Note,
+			Tags:         m.Tags,
+			Status:       "published",
+		})
+		if _, err := tx.Exec(insertPoemSQL, params...); err != nil {
 			return fmt.Errorf("写入诗词 %q: %w", m.Title, err)
 		}
 	}
 	return tx.Commit()
 }
 
-const poemCols = `p.id, p.title, p.poet_id, p.poet_name, p.dynasty, p.genre, p.content, p.tags, p.note`
+// ── 诗词查询 ───────────────────────────────────────────
+
+const poemCols = `p.id, p.title, p.author, p.dynasty, p.category, p.content,
+	p.translation, p.annotation, p.appreciation, p.tags, p.featured,
+	p.view_count, p.favorite_count, p.comment_count, p.status`
 
 func scanPoem(row interface{ Scan(...any) error }) (model.Poem, error) {
 	var m model.Poem
-	err := row.Scan(&m.ID, &m.Title, &m.PoetID, &m.PoetName, &m.Dynasty, &m.Genre, &m.Content, &m.Tags, &m.Note)
-	return m, err
+	var tags sql.NullString
+	var featured int
+	err := row.Scan(&m.ID, &m.Title, &m.Author, &m.Dynasty, &m.Category, &m.Content,
+		&m.Translation, &m.Annotation, &m.Appreciation, &tags, &featured,
+		&m.ViewCount, &m.FavoriteCount, &m.CommentCount, &m.Status)
+	if err != nil {
+		return m, err
+	}
+	m.Tags = tagsToText(tags)
+	m.Featured = featured != 0
+	return m, nil
+}
+
+// tagsToText 把库中的 JSON 数组转成逗号分隔标签（兼容纯文本标签）。
+func tagsToText(v sql.NullString) string {
+	if !v.Valid {
+		return ""
+	}
+	s := strings.TrimSpace(v.String)
+	if !strings.HasPrefix(s, "[") {
+		return s
+	}
+	var list []string
+	if err := json.Unmarshal([]byte(s), &list); err != nil {
+		return strings.Trim(s, `[]"`)
+	}
+	return strings.Join(list, ",")
+}
+
+// tagsToJSON 把逗号分隔标签转成 JSON 数组（空则 NULL）。
+func tagsToJSON(tags string) any {
+	var list []string
+	for _, t := range strings.Split(tags, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			list = append(list, t)
+		}
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return nil
+	}
+	return string(b)
 }
 
 func like(v string) string { return "%" + v + "%" }
 
-func (f *Filter) clauses() (string, []any) {
+// booleanQuery 清理 BOOLEAN MODE 保留字符（+ - > < ( ) ~ * " @），避免语法错误。
+func booleanQuery(q string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case '+', '-', '>', '<', '(', ')', '~', '*', '"', '@', ':':
+			return ' '
+		}
+		return r
+	}, q)
+	return strings.Join(strings.Fields(cleaned), " ")
+}
+
+// searchable ngram 最小分词长度为 2，全部词都短于 2 字时无法命中索引。
+func searchable(q string) bool {
+	for _, tk := range strings.Fields(q) {
+		if len([]rune(tk)) >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+// clauses 构造过滤条件。全文检索时返回相关度排序表达式（args 对应 where，
+// orderArgs 对应 ORDER BY 的占位符）。
+func (s *Store) clauses(f *Filter) (where string, args []any, order string, orderArgs []any) {
 	var conds []string
-	var args []any
+	var rankArgs []any
+
 	if q := strings.TrimSpace(f.Keyword); q != "" {
-		conds = append(conds, `(p.title LIKE ? OR p.content LIKE ? OR p.poet_name LIKE ? OR p.tags LIKE ?)`)
-		args = append(args, like(q), like(q), like(q), like(q))
+		bq := booleanQuery(q)
+		if s.fulltext && bq != "" && searchable(bq) {
+			// ngram 全文索引：BOOLEAN MODE 精确/分词匹配 + 自然语言相关度排序
+			conds = append(conds, `MATCH(`+fulltextCols+`) AGAINST(? IN BOOLEAN MODE)`)
+			args = append(args, bq)
+			order = `MATCH(` + fulltextCols + `) AGAINST(? IN NATURAL LANGUAGE MODE) DESC, p.id`
+			rankArgs = append(rankArgs, bq)
+		} else {
+			// 单字关键词 / 无全文索引（SQLite、未建索引的库）：回退 LIKE
+			conds = append(conds, `(p.title LIKE ? OR p.author LIKE ? OR p.content LIKE ? OR CAST(p.tags AS CHAR) LIKE ?)`)
+			args = append(args, like(q), like(q), like(q), like(q))
+		}
 	}
 	if v := strings.TrimSpace(f.Poet); v != "" {
-		conds = append(conds, `p.poet_name LIKE ?`)
+		conds = append(conds, `p.author LIKE ?`)
 		args = append(args, like(v))
 	}
 	if v := strings.TrimSpace(f.Dynasty); v != "" {
@@ -246,17 +558,18 @@ func (f *Filter) clauses() (string, []any) {
 		args = append(args, v)
 	}
 	if v := strings.TrimSpace(f.Genre); v != "" {
-		conds = append(conds, `p.genre = ?`)
+		conds = append(conds, `p.category = ?`)
 		args = append(args, v)
 	}
 	if v := strings.TrimSpace(f.Tag); v != "" {
-		conds = append(conds, `p.tags LIKE ?`)
+		conds = append(conds, `CAST(p.tags AS CHAR) LIKE ?`)
 		args = append(args, like(v))
 	}
-	if len(conds) == 0 {
-		return "", args
+	conds = append(conds, publishedCond)
+	if order == "" {
+		order = "p.id"
 	}
-	return " WHERE " + strings.Join(conds, " AND "), args
+	return " WHERE " + strings.Join(conds, " AND "), args, order, rankArgs
 }
 
 // ListPoems 按条件检索（含总数）。分页参数被钳制在安全范围。
@@ -267,36 +580,72 @@ func (s *Store) ListPoems(f Filter) ([]model.Poem, int, error) {
 	if f.PageSize < 1 || f.PageSize > 100 {
 		f.PageSize = 20
 	}
-	where, args := f.clauses()
+	where, args, order, orderArgs := s.clauses(&f)
 
 	var total int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems p`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
-	q := `SELECT ` + poemCols + ` FROM poems p` + where +
-		` ORDER BY p.id LIMIT ? OFFSET ?`
-	args = append(args, f.PageSize, (f.Page-1)*f.PageSize)
-	rows, err := s.db.Query(q, args...)
+	q := `SELECT ` + poemCols + ` FROM poems p` + where + ` ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+	queryArgs := append(append([]any{}, args...), orderArgs...)
+	queryArgs = append(queryArgs, f.PageSize, (f.Page-1)*f.PageSize)
+	rows, err := s.db.Query(q, queryArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rows.Close()
 
+	list, err := collectPoems(rows)
+	if err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
+func collectPoems(rows *sql.Rows) ([]model.Poem, error) {
 	var list []model.Poem
 	for rows.Next() {
 		m, err := scanPoem(rows)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		list = append(list, m)
 	}
-	return list, total, rows.Err()
+	return list, rows.Err()
 }
 
-// GetPoem 按 ID 取一首。
+// FeaturedPoems 首页「名篇撷英」：精选优先，不足按主键顺序补足。
+func (s *Store) FeaturedPoems(limit int) []model.Poem {
+	if limit < 1 || limit > 50 {
+		limit = 8
+	}
+	rows, err := s.db.Query(`SELECT `+poemCols+` FROM poems p WHERE `+publishedCond+
+		` ORDER BY p.featured DESC, p.id LIMIT ?`, limit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	list, _ := collectPoems(rows)
+	return list
+}
+
+// recentPoems 最近收录（按主键倒序）。
+func (s *Store) recentPoems(limit int) []model.Poem {
+	rows, err := s.db.Query(`SELECT `+poemCols+` FROM poems p WHERE `+publishedCond+
+		` ORDER BY p.id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	list, _ := collectPoems(rows)
+	return list
+}
+
+// GetPoem 按 ID 取一首（status=archived 视为已删除，不再对外可见；草稿仍可读以便后台编辑）。
 func (s *Store) GetPoem(id int64) (model.Poem, error) {
-	row := s.db.QueryRow(`SELECT `+poemCols+` FROM poems p WHERE p.id = ?`, id)
+	q := `SELECT ` + poemCols + ` FROM poems p WHERE p.id = ? AND p.status <> 'archived'`
+	row := s.db.QueryRow(q, id)
 	m, err := scanPoem(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Poem{}, ErrNotFound
@@ -306,73 +655,101 @@ func (s *Store) GetPoem(id int64) (model.Poem, error) {
 
 // PrevNext 相邻两首（按 id 顺序）。
 func (s *Store) PrevNext(id int64) (prev, next *model.Poem) {
-	var p model.Poem
-	row := s.db.QueryRow(`SELECT `+poemCols+` FROM poems p WHERE p.id = (SELECT MAX(id) FROM poems WHERE id < ?)`, id)
+	row := s.db.QueryRow(`SELECT `+poemCols+` FROM poems p WHERE p.id < ? AND `+publishedCond+
+		` ORDER BY p.id DESC LIMIT 1`, id)
 	if m, err := scanPoem(row); err == nil {
-		p = m
-		prev = &p
+		prev = &m
 	}
-	var n model.Poem
-	row = s.db.QueryRow(`SELECT `+poemCols+` FROM poems p WHERE p.id = (SELECT MIN(id) FROM poems WHERE id > ?)`, id)
+	row = s.db.QueryRow(`SELECT `+poemCols+` FROM poems p WHERE p.id > ? AND `+publishedCond+
+		` ORDER BY p.id LIMIT 1`, id)
 	if m, err := scanPoem(row); err == nil {
-		n = m
-		next = &n
+		next = &m
 	}
 	return
 }
 
-// RandomPoem 随机一首（SQLite: RANDOM() / MySQL: RAND()）。
-func (s *Store) RandomPoem() (model.Poem, error) {
-	row := s.db.QueryRow(`SELECT ` + poemCols + ` FROM poems p ORDER BY ` + s.d.randFn + ` LIMIT 1`)
+// idRange 已发布作品的主键区间，用于随机/每日取词（避免 ORDER BY RAND() 全表排序）。
+func (s *Store) idRange() (int64, int64, error) {
+	var lo, hi sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MIN(id), MAX(id) FROM poems p WHERE `+publishedCond).
+		Scan(&lo, &hi); err != nil {
+		return 0, 0, err
+	}
+	if !lo.Valid || !hi.Valid {
+		return 0, 0, ErrNotFound
+	}
+	return lo.Int64, hi.Int64, nil
+}
+
+// poemAtOrAfter 取 id >= target 的第一首（越过末尾则回退到最早一首）。
+func (s *Store) poemAtOrAfter(target int64) (model.Poem, error) {
+	row := s.db.QueryRow(`SELECT `+poemCols+` FROM poems p WHERE p.id >= ? AND `+publishedCond+
+		` ORDER BY p.id LIMIT 1`, target)
 	m, err := scanPoem(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		row = s.db.QueryRow(`SELECT ` + poemCols + ` FROM poems p WHERE ` + publishedCond +
+			` ORDER BY p.id LIMIT 1`)
+		m, err = scanPoem(row)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Poem{}, ErrNotFound
 	}
 	return m, err
 }
 
+// RandomPoem 随机一首。
+func (s *Store) RandomPoem() (model.Poem, error) {
+	lo, hi, err := s.idRange()
+	if err != nil {
+		return model.Poem{}, err
+	}
+	return s.poemAtOrAfter(lo + rand.Int63n(hi-lo+1))
+}
+
 // DailyPoem 今日诗词：按日期确定性挑选（一天内稳定，跨天轮换）。
 func (s *Store) DailyPoem() (model.Poem, error) {
-	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems`).Scan(&total); err != nil || total == 0 {
-		return model.Poem{}, ErrNotFound
+	lo, hi, err := s.idRange()
+	if err != nil {
+		return model.Poem{}, err
 	}
+	span := hi - lo + 1
 	day := time.Now().Unix() / 86400
-	idx := (day*2654435761 + 12345) % int64(total)
+	idx := (day*2654435761 + 12345) % span
 	if idx < 0 {
-		idx += int64(total)
+		idx += span
 	}
-	var id int64
-	if err := s.db.QueryRow(`SELECT id FROM poems ORDER BY id LIMIT 1 OFFSET ?`, idx).Scan(&id); err != nil {
-		return model.Poem{}, ErrNotFound
-	}
-	return s.GetPoem(id)
+	return s.poemAtOrAfter(lo + idx)
 }
 
 // ErrNotFound 统一的「不存在」错误。
 var ErrNotFound = errors.New("记录不存在")
 
-// ── 诗人 ──────────────────────────────────────────────
+// ── 诗人（由 poems 聚合派生） ───────────────────────────
 
-// ListPoets 诗人列表（含作品数），支持关键词（姓名/朝代）与朝代过滤。
+// poetLimit 诗人列表默认返回条数（全库逾万位作者，按作品数取前若干）。
+const poetLimit = 300
+
+// ListPoets 诗人列表（含作品数），支持姓名关键词与朝代过滤。
 func (s *Store) ListPoets(keyword, dynasty string) ([]model.Poet, error) {
 	var conds []string
 	var args []any
 	if q := strings.TrimSpace(keyword); q != "" {
-		conds = append(conds, `(t.name LIKE ? OR t.intro LIKE ?)`)
-		args = append(args, like(q), like(q))
+		conds = append(conds, `p.author LIKE ?`)
+		args = append(args, like(q))
 	}
 	if v := strings.TrimSpace(dynasty); v != "" {
-		conds = append(conds, `t.dynasty = ?`)
+		conds = append(conds, `p.dynasty = ?`)
 		args = append(args, v)
 	}
-	where := ""
-	if len(conds) > 0 {
-		where = " WHERE " + strings.Join(conds, " AND ")
-	}
-	q := `SELECT t.id, t.name, t.dynasty, t.intro,
-	         (SELECT COUNT(*) FROM poems p WHERE p.poet_id = t.id) AS cnt
-	      FROM poets t` + where + ` ORDER BY t.id`
+	conds = append(conds, publishedCond)
+
+	q := `SELECT p.author, p.dynasty, COUNT(*) AS cnt
+	      FROM poems p WHERE ` + strings.Join(conds, " AND ") + `
+	      GROUP BY p.author, p.dynasty
+	      ORDER BY cnt DESC, p.author
+	      LIMIT ?`
+	args = append(args, poetLimit)
+
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
@@ -383,137 +760,174 @@ func (s *Store) ListPoets(keyword, dynasty string) ([]model.Poet, error) {
 	for rows.Next() {
 		var p model.Poet
 		var cnt int
-		if err := rows.Scan(&p.ID, &p.Name, &p.Dynasty, &p.Intro, &cnt); err != nil {
+		if err := rows.Scan(&p.Name, &p.Dynasty, &cnt); err != nil {
 			return nil, err
 		}
 		p.PoemCount = cnt
+		p.Intro = poetIntros[p.Name]
 		list = append(list, p)
 	}
 	return list, rows.Err()
 }
 
-// GetPoet 按 ID 取诗人。
-func (s *Store) GetPoet(id int64) (model.Poet, error) {
+// GetPoet 按姓名取诗人（同名跨朝代时取作品最多者）。
+func (s *Store) GetPoet(name string) (model.Poet, error) {
 	var p model.Poet
-	row := s.db.QueryRow(`SELECT id, name, dynasty, intro FROM poets WHERE id = ?`, id)
-	if err := row.Scan(&p.ID, &p.Name, &p.Dynasty, &p.Intro); errors.Is(err, sql.ErrNoRows) {
+	var cnt int
+	err := s.db.QueryRow(`SELECT p.author, p.dynasty, COUNT(*) AS cnt
+		FROM poems p WHERE p.author = ? AND `+publishedCond+`
+		GROUP BY p.author, p.dynasty ORDER BY cnt DESC LIMIT 1`, name).
+		Scan(&p.Name, &p.Dynasty, &cnt)
+	if errors.Is(err, sql.ErrNoRows) {
 		return p, ErrNotFound
-	} else if err != nil {
+	}
+	if err != nil {
 		return p, err
 	}
-	var cnt int
-	s.db.QueryRow(`SELECT COUNT(*) FROM poems WHERE poet_id = ?`, id).Scan(&cnt)
 	p.PoemCount = cnt
+	p.Intro = poetIntros[p.Name]
 	return p, nil
 }
 
-// PoemsByPoet 某诗人的全部作品。
-func (s *Store) PoemsByPoet(poetID int64) ([]model.Poem, error) {
-	rows, err := s.db.Query(`SELECT `+poemCols+` FROM poems p WHERE p.poet_id = ? ORDER BY p.id`, poetID)
+// PoetPoemLimit 诗人详情页最多展示的作品数。
+const PoetPoemLimit = 200
+
+// PoemsByPoet 某诗人的作品（按主键顺序，最多 PoetPoemLimit 首）。
+func (s *Store) PoemsByPoet(name string) ([]model.Poem, error) {
+	rows, err := s.db.Query(`SELECT `+poemCols+` FROM poems p WHERE p.author = ? AND `+
+		publishedCond+` ORDER BY p.id LIMIT ?`, name, PoetPoemLimit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var list []model.Poem
-	for rows.Next() {
-		m, err := scanPoem(rows)
-		if err != nil {
-			return nil, err
-		}
-		list = append(list, m)
+	return collectPoems(rows)
+}
+
+// PoetOptions 下拉选项：作品最多的诗人。
+func (s *Store) PoetOptions() []model.Poet { poets, _ := s.ListPoets("", ""); return poets }
+
+// RenamePoet 重命名诗人（批量更新其作品上的 author/dynasty）。
+func (s *Store) RenamePoet(oldName, newName, newDynasty string) error {
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return errors.New("诗人姓名不能为空")
 	}
-	return list, rows.Err()
+	res, err := s.db.Exec(`UPDATE poems SET author=?, dynasty=? WHERE author=?`,
+		newName, strings.TrimSpace(newDynasty), oldName)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	s.invalidateMeta()
+	return nil
+}
+
+// DeletePoet 删除诗人：把其全部作品置为 archived（状态位软删除，不做物理 DELETE）。
+func (s *Store) DeletePoet(name string) error {
+	res, err := s.db.Exec(`UPDATE poems SET status='archived' WHERE author=? AND status<>'archived'`, name)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	s.invalidateMeta()
+	return nil
 }
 
 // ── 后台 CRUD ─────────────────────────────────────────
 
-func (s *Store) CreatePoet(name, dynasty, intro string) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO poets(name, dynasty, intro) VALUES(?,?,?)`,
-		strings.TrimSpace(name), strings.TrimSpace(dynasty), strings.TrimSpace(intro))
-	if err != nil {
-		return 0, err
+const insertPoemSQL = `INSERT INTO poems
+	(title, author, dynasty, category, content, translation, annotation, appreciation, tags, featured, status)
+	VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+
+func poemParams(m model.Poem) []any {
+	status := strings.TrimSpace(m.Status)
+	if status == "" {
+		status = "published"
 	}
-	return res.LastInsertId()
+	featured := 0
+	if m.Featured {
+		featured = 1
+	}
+	return []any{
+		strings.TrimSpace(m.Title), strings.TrimSpace(m.Author), strings.TrimSpace(m.Dynasty),
+		defaultIfEmpty(strings.TrimSpace(m.Category), "古诗"), m.Content,
+		m.Translation, m.Annotation, m.Appreciation, tagsToJSON(m.Tags), featured, status,
+	}
 }
 
-func (s *Store) UpdatePoet(id int64, name, dynasty, intro string) error {
-	if _, err := s.db.Exec(`UPDATE poets SET name=?, dynasty=?, intro=? WHERE id=?`,
-		strings.TrimSpace(name), strings.TrimSpace(dynasty), strings.TrimSpace(intro), id); err != nil {
-		return err
+func defaultIfEmpty(v, def string) string {
+	if v == "" {
+		return def
 	}
-	// 同步反规范化字段
-	_, err := s.db.Exec(`UPDATE poems SET poet_name=?, dynasty=? WHERE poet_id=?`,
-		strings.TrimSpace(name), strings.TrimSpace(dynasty), id)
-	return err
+	return v
 }
 
-func (s *Store) DeletePoet(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM poets WHERE id=?`, id)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
+// CreatePoem 新增作品。
 func (s *Store) CreatePoem(m model.Poem) (int64, error) {
-	// 由诗人 ID 补齐诗人姓名与朝代
-	var name, dynasty string
-	err := s.db.QueryRow(`SELECT name, dynasty FROM poets WHERE id=?`, m.PoetID).Scan(&name, &dynasty)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, ErrNotFound
-	}
+	res, err := s.db.Exec(insertPoemSQL, poemParams(m)...)
 	if err != nil {
 		return 0, err
 	}
-	res, err := s.db.Exec(
-		`INSERT INTO poems(title, poet_id, poet_name, dynasty, genre, content, tags, note)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		m.Title, m.PoetID, name, dynasty, m.Genre, m.Content, m.Tags, m.Note)
-	if err != nil {
-		return 0, err
-	}
+	s.invalidateMeta()
 	return res.LastInsertId()
 }
 
+// UpdatePoem 修改作品。
 func (s *Store) UpdatePoem(m model.Poem) error {
-	var name, dynasty string
-	err := s.db.QueryRow(`SELECT name, dynasty FROM poets WHERE id=?`, m.PoetID).Scan(&name, &dynasty)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
+	status := strings.TrimSpace(m.Status)
+	if status == "" {
+		status = "published"
 	}
-	if err != nil {
-		return err
+	featured := 0
+	if m.Featured {
+		featured = 1
 	}
-	res, err := s.db.Exec(
-		`UPDATE poems SET title=?, poet_id=?, poet_name=?, dynasty=?, genre=?, content=?, tags=?, note=? WHERE id=?`,
-		m.Title, m.PoetID, name, dynasty, m.Genre, m.Content, m.Tags, m.Note, m.ID)
+	res, err := s.db.Exec(`UPDATE poems SET
+		title=?, author=?, dynasty=?, category=?, content=?,
+		translation=?, annotation=?, appreciation=?, tags=?, featured=?, status=?
+		WHERE id=?`,
+		strings.TrimSpace(m.Title), strings.TrimSpace(m.Author), strings.TrimSpace(m.Dynasty),
+		defaultIfEmpty(strings.TrimSpace(m.Category), "古诗"), m.Content,
+		m.Translation, m.Annotation, m.Appreciation, tagsToJSON(m.Tags), featured, status, m.ID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
+	s.invalidateMeta()
 	return nil
 }
 
+// DeletePoem 删除作品：置 status='archived'（状态位软删除，数据保留，不做物理 DELETE）。
 func (s *Store) DeletePoem(id int64) error {
-	res, err := s.db.Exec(`DELETE FROM poems WHERE id=?`, id)
+	res, err := s.db.Exec(`UPDATE poems SET status='archived' WHERE id=? AND status<>'archived'`, id)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
 	}
+	s.invalidateMeta()
 	return nil
 }
 
 // ── 元数据 / 统计 ──────────────────────────────────────
 
 func (s *Store) distinct(col string) []string {
-	rows, err := s.db.Query(`SELECT DISTINCT ` + col + ` FROM poems WHERE ` + col + ` <> '' ORDER BY ` + col)
+	s.metaMu.Lock()
+	if e, ok := s.meta[col]; ok && time.Since(e.at) < metaTTL {
+		s.metaMu.Unlock()
+		return e.val
+	}
+	s.metaMu.Unlock()
+
+	rows, err := s.db.Query(`SELECT DISTINCT ` + col + ` FROM poems p WHERE ` + publishedCond +
+		` AND ` + col + ` <> '' ORDER BY ` + col)
 	if err != nil {
 		return nil
 	}
@@ -525,17 +939,31 @@ func (s *Store) distinct(col string) []string {
 			out = append(out, v)
 		}
 	}
+
+	s.metaMu.Lock()
+	if s.meta == nil {
+		s.meta = make(map[string]memoEntry, 2)
+	}
+	s.meta[col] = memoEntry{val: out, at: time.Now()}
+	s.metaMu.Unlock()
 	return out
 }
 
+// invalidateMeta 写入数据后清空缓存（朝代/体裁/统计）。
+func (s *Store) invalidateMeta() {
+	s.metaMu.Lock()
+	s.meta = nil
+	s.metaMu.Unlock()
+	s.statsMu.Lock()
+	s.statsAt = time.Time{}
+	s.statsMu.Unlock()
+}
+
 // Dynasties 诗词涉及的朝代列表。
-func (s *Store) Dynasties() []string { return s.distinct("dynasty") }
+func (s *Store) Dynasties() []string { return s.distinct("p.dynasty") }
 
-// Genres 诗词涉及的体裁列表。
-func (s *Store) Genres() []string { return s.distinct("genre") }
-
-// PoetOptions 下拉选项：所有诗人（含作品数）。
-func (s *Store) PoetOptions() []model.Poet { poets, _ := s.ListPoets("", ""); return poets }
+// Genres 诗词涉及的体裁列表（category 列）。
+func (s *Store) Genres() []string { return s.distinct("p.category") }
 
 // Stats 后台统计。
 type Stats struct {
@@ -550,16 +978,27 @@ type Count struct {
 	N     int
 }
 
-// Stats 返回统计信息。
+// Stats 返回统计信息（statsTTL 内复用，避免每次全表 COUNT）。
 func (s *Store) Stats() (Stats, error) {
+	s.statsMu.Lock()
+	if !s.statsAt.IsZero() && time.Since(s.statsAt) < statsTTL {
+		cached := s.statsVal
+		s.statsMu.Unlock()
+		return cached, nil
+	}
+	s.statsMu.Unlock()
+
 	var st Stats
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems`).Scan(&st.Poems); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems p WHERE ` + publishedCond).
+		Scan(&st.Poems); err != nil {
 		return st, err
 	}
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poets`).Scan(&st.Poets); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT author) FROM poems p WHERE ` + publishedCond).
+		Scan(&st.Poets); err != nil {
 		return st, err
 	}
-	rows, err := s.db.Query(`SELECT dynasty, COUNT(*) FROM poems WHERE dynasty <> '' GROUP BY dynasty ORDER BY COUNT(*) DESC`)
+	rows, err := s.db.Query(`SELECT p.dynasty, COUNT(*) FROM poems p WHERE ` + publishedCond +
+		` AND p.dynasty <> '' GROUP BY p.dynasty ORDER BY COUNT(*) DESC`)
 	if err == nil {
 		for rows.Next() {
 			var c Count
@@ -569,7 +1008,12 @@ func (s *Store) Stats() (Stats, error) {
 		}
 		rows.Close()
 	}
-	st.Recent, _, _ = s.ListPoems(Filter{Page: 1, PageSize: 6})
+	st.Recent = s.recentPoems(6)
+
+	s.statsMu.Lock()
+	s.statsVal = st
+	s.statsAt = time.Now()
+	s.statsMu.Unlock()
 	return st, nil
 }
 

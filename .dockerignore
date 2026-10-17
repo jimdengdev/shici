@@ -1,0 +1,13 @@
+# 构建上下文排除：避免密钥与本地数据被打进镜像/缓存层
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.idea
+.tmp
+server
+data/*.db
+data/*.db-*
+README.md
+compose.yml

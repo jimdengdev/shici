@@ -19,10 +19,11 @@ services:
     ports:
       - "${APP_PORT:-8080}:8080"
     environment:
-      PORT: 8080
+      PORT: "${PORT:-8080}"
       ADMIN_USER: "${ADMIN_USER:-admin}"
       ADMIN_PASS: "${ADMIN_PASS:?请在 .env 中设置后台密码}"
       SHICI_MYSQL_DSN: "${SHICI_MYSQL_DSN:-}"
+      SHICI_MYSQL_DB: "${SHICI_MYSQL_DB:-poetry_charity}"
     extra_hosts:
       - "host.docker.internal:host-gateway" # 容器访问宿主机 MySQL（1Panel 安装）
     volumes:
