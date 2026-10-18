@@ -17,11 +17,9 @@
 
   <h4>开放 API</h4>
   <ul>
-    <li><code>GET /api/poems?keyword=明月&amp;poet=李白&amp;dynasty=唐&amp;page=1</code> — 诗词检索</li>
-    <li><code>GET /api/poems/{id}</code> — 单首详情</li>
-    <li><code>GET /api/poets?keyword=苏轼</code> — 诗人检索</li>
-    <li><code>GET /api/poets/{id}</code> — 诗人详情（含作品）</li>
-    <li><code>GET /api/search?q=黄河</code> — 检索别名</li>
+    <li><code>GET /api/random</code> — 随机一首诗（整首）</li>
+    <li><code>GET /api/random/line</code> — 随机一首诗中的一句</li>
+    <li><code>GET /api/poem?title=静夜思</code> — 按诗名取整首诗（同名可加 <code>&amp;author=李白</code> 消歧）</li>
   </ul>
 
   <h4>后台管理</h4>

@@ -68,15 +68,26 @@ ADMIN_PASS=你的后台密码
 
 ## 开放 API（JSON）
 
+只开放三个接口，返回均为 UTF-8 JSON：
+
 ```
-GET /api/poems?keyword=明月&poet=李白&dynasty=唐&category=宋词&tag=思乡&page=1
-GET /api/poems/{id}
-GET /api/poets?keyword=苏轼
-GET /api/poets/{name}        # 诗人详情（含其作品，最多 200 首），如 /api/poets/李白
-GET /api/search?q=黄河       # 检索别名
+GET /api/random                      # 随机一首诗（整首）
+GET /api/random/line                 # 随机一首诗中的一句
+GET /api/poem?title=静夜思           # 按诗名取整首诗（同名可加 &author=李白 消歧）
 ```
 
-> 体裁参数写作 `category`（兼容旧写法 `genre`）。
+- `/api/random`、`/api/poem` 返回诗对象：`id / title / author / dynasty / category / content / lines[] / translation / annotation / appreciation / tags[] / url`，空字段省略
+- `/api/random/line` 返回：`{"line": "举头望明月，", "poem": {诗对象}}`，`poem` 为该句所属作品
+- 出错返回 `{"error": "..."}`：缺 `title` 为 400，未找到为 404，触发限流为 429
+- **限流**：三个接口合计 **20 QPS**（进程内令牌桶，突发容量 20，见 `internal/web/limit.go`）；超限返回 429 并带 `Retry-After: 1`、`X-RateLimit-Limit: 20`。页面路由不受限；多实例部署时需改为共享计数或在反向代理侧限流
+
+```bash
+curl 'http://localhost:8080/api/random'
+curl 'http://localhost:8080/api/random/line'
+curl 'http://localhost:8080/api/poem?title=%E9%9D%99%E5%A4%9C%E6%80%9D'
+```
+
+> 随机接口每次结果不同，不缓存；按诗名接口按 URI 缓存（见上文缓存说明）。
 
 ## 后台管理
 
@@ -213,8 +224,15 @@ EXPLAIN SELECT id FROM poems WHERE status='published' ORDER BY id LIMIT 20;
 
 | 层 | 内容 | TTL |
 |---|---|---|
-| 数据层 | 朝代/体裁 24h · 统计 6h · 诗人榜 12h · 首页名篇 6h · 主键区间 6h · 检索总数 30min | 见 `store.go` |
+| 数据层 | 朝代/体裁 24h · 统计 6h · 诗人榜 12h · 首页名篇 6h · 主键区间 6h · 检索总数 30min · 按诗名 30min | 见 `store.go` |
+| 随机池 | 随机整首 / 随机一句：一次采样 64 个随机起点入池，逐个消费，余量不足后台补 | `store.go` 的 `pool[T]` |
 | 页面层 | 渲染后的 HTML/JSON（按 URI，30min，32MiB LRU） | `internal/web/cache.go` |
+
+开放 API 的缓存策略：
+
+- `/api/random`、`/api/random/line`：结果每次不同，**不能按 URI 缓存**，改为「随机池」前置缓存——一次回源采样 64 个随机起点（每起点取一首，4 路并发）填入池，之后每个请求只从池里取一个，余量不足一半时后台异步补一批；数据库往返降为约 1/64，随机接口响应 `Cache-Control: no-store`，避免被代理/CDN 缓存成同一首
+- `/api/poem?title=…`：数据层按「诗名+作者」缓存 30min（含「查无此诗」的负结果，避免重复回源），外层再叠加按 URI 的页面缓存，命中即零回源
+- 随机池与数据缓存均已登记到 `memo`：后台写入或 `SIGUSR1` 时一并清空
 
 - 命中情况看响应头 `X-Cache: HIT/MISS`
 - 后台增删改会立即清空全部缓存；批量导入数据后手动清：

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/kataras/iris/v12"
 	"github.com/kataras/iris/v12/view"
@@ -32,12 +33,13 @@ func Register(app *iris.Application, st *store.Store) {
 	app.Get("/about", pc, about)
 	app.Get("/random", random(st)) // 每次随机跳转，不缓存
 
-	// JSON API（同样按 URI 缓存）
-	app.Get("/api/poems", pc, apiListPoems(st))
-	app.Get("/api/poems/{id:int64}", pc, apiPoem(st))
-	app.Get("/api/poets", pc, apiListPoets(st))
-	app.Get("/api/poets/{name:string}", pc, apiPoet(st))
-	app.Get("/api/search", pc, apiListPoems(st)) // /api/search?q=... 别名
+	// JSON API：只开放三个——随机整首、随机一句、按诗名取全篇。
+	// 三个接口共用一个 20 QPS 的限流器（挂最外层，超限时连缓存都不查）；
+	// 随机接口每次结果不同，不挂页面缓存；按诗名可按 URI 缓存。
+	rl := RateLimit()
+	app.Get("/api/random", rl, apiRandomPoem(st))
+	app.Get("/api/random/line", rl, apiRandomLine(st))
+	app.Get("/api/poem", rl, pc, apiPoemByTitle(st)) // /api/poem?title=静夜思[&author=李白]
 }
 
 // render 公共渲染：默认布局 + 公共导航数据。
@@ -175,62 +177,85 @@ func about(ctx iris.Context) {
 
 // ── JSON API ───────────────────────────────────────────
 
-func apiListPoems(st *store.Store) iris.Handler {
-	return func(ctx iris.Context) {
-		f := filterFrom(ctx)
-		if ctx.URLParam("q") != "" && f.Keyword == "" {
-			f.Keyword = ctx.URLParam("q") // /api/search?q=
-		}
-		list, total, err := st.ListPoems(f)
-		if err != nil {
-			ctx.StatusCode(iris.StatusInternalServerError)
-			ctx.JSON(iris.Map{"error": err.Error()})
-			return
-		}
-		ctx.JSON(iris.Map{
-			"items": list, "total": total,
-			"page": f.Page, "page_size": f.PageSize,
-			"keyword": f.Keyword, "poet": f.Poet,
-			"dynasty": f.Dynasty, "category": f.Genre,
-		})
+// poemView 对外的诗词视图：正文同时给出整段与逐行两种形式，空字段不输出。
+type poemView struct {
+	ID           int64    `json:"id"`
+	Title        string   `json:"title"`
+	Author       string   `json:"author"`
+	Dynasty      string   `json:"dynasty,omitempty"`
+	Category     string   `json:"category,omitempty"`
+	Content      string   `json:"content"`
+	Lines        []string `json:"lines"`
+	Translation  string   `json:"translation,omitempty"`
+	Annotation   string   `json:"annotation,omitempty"`
+	Appreciation string   `json:"appreciation,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	URL          string   `json:"url"`
+}
+
+func newPoemView(m model.Poem) poemView {
+	return poemView{
+		ID:           m.ID,
+		Title:        m.Title,
+		Author:       m.Author,
+		Dynasty:      m.Dynasty,
+		Category:     m.Category,
+		Content:      m.Content,
+		Lines:        m.Lines(),
+		Translation:  m.Translation,
+		Annotation:   m.Annotation,
+		Appreciation: m.Appreciation,
+		Tags:         m.TagList(),
+		URL:          fmt.Sprintf("/poems/%d", m.ID),
 	}
 }
 
-func apiPoem(st *store.Store) iris.Handler {
+func jsonErr(ctx iris.Context, code int, msg string) {
+	ctx.StatusCode(code)
+	ctx.JSON(iris.Map{"error": msg})
+}
+
+// apiRandomPoem 随机整首诗（走随机池，命中即零回源）。
+func apiRandomPoem(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		m, err := st.GetPoem(ctx.Params().GetInt64Default("id", 0))
+		// 结果每次不同，禁止任何中间层缓存，否则会「随机成同一首」
+		ctx.Header("Cache-Control", "no-store")
+		m, err := st.RandomPoem()
 		if err != nil {
-			ctx.StatusCode(iris.StatusNotFound)
-			ctx.JSON(iris.Map{"error": "诗词不存在"})
+			jsonErr(ctx, iris.StatusNotFound, "暂无诗词")
 			return
 		}
-		ctx.JSON(iris.Map{"item": m})
+		ctx.JSON(newPoemView(m))
 	}
 }
 
-func apiListPoets(st *store.Store) iris.Handler {
+// apiRandomLine 随机一首诗中的一句（走随机句池）。
+func apiRandomLine(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		poets, err := st.ListPoets(ctx.URLParam("keyword"), ctx.URLParam("dynasty"))
+		ctx.Header("Cache-Control", "no-store")
+		res, err := st.RandomLine()
 		if err != nil {
-			ctx.StatusCode(iris.StatusInternalServerError)
-			ctx.JSON(iris.Map{"error": err.Error()})
+			jsonErr(ctx, iris.StatusNotFound, "暂无诗词")
 			return
 		}
-		ctx.JSON(iris.Map{"items": poets, "total": len(poets)})
+		ctx.JSON(iris.Map{"line": res.Line, "poem": newPoemView(res.Poem)})
 	}
 }
 
-func apiPoet(st *store.Store) iris.Handler {
+// apiPoemByTitle 按诗名取整首诗（同名可加 author 消歧）。
+func apiPoemByTitle(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		name, _ := url.PathUnescape(ctx.Params().Get("name"))
-		p, err := st.GetPoet(name)
-		if err != nil {
-			ctx.StatusCode(iris.StatusNotFound)
-			ctx.JSON(iris.Map{"error": "诗人不存在"})
+		title := strings.TrimSpace(ctx.URLParam("title"))
+		if title == "" {
+			jsonErr(ctx, iris.StatusBadRequest, "缺少参数 title")
 			return
 		}
-		poems, _ := st.PoemsByPoet(p.Name)
-		ctx.JSON(iris.Map{"item": p, "poems": poems})
+		m, err := st.GetPoemByTitle(title, ctx.URLParam("author"))
+		if err != nil {
+			jsonErr(ctx, iris.StatusNotFound, "诗词不存在")
+			return
+		}
+		ctx.JSON(newPoemView(m))
 	}
 }
 

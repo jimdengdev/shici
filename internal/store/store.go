@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql" // MySQL 驱动（纯 Go）
@@ -178,6 +179,12 @@ type Store struct {
 	metaCache  *memo.Cache[string, []string]     // 朝代/体裁 DISTINCT
 	statsCache *memo.Cache[string, Stats]        // 后台统计
 	rangeCache *memo.Cache[string, [2]int64]     // 已发布主键区间 MIN/MAX
+	titleCache *memo.Cache[string, model.Poem]   // 按诗名取全篇（开放 API）
+
+	// 随机池（前置缓存）：随机结果不能按 URI 缓存，改为「批量回源 + 逐个消费」，
+	// 一次回源取一批候选，之后的请求直接从池里取，见 pool 说明。
+	randPoemPool *pool[model.Poem]
+	randLinePool *pool[RandomLineResult]
 }
 
 // 缓存 TTL：按数据变动频率设定；后台写入会立即失效，SIGUSR1 可全量清空。
@@ -188,7 +195,11 @@ const (
 	poetTTL     = 12 * time.Hour   // 诗人榜（GROUP BY author 全表聚合）
 	featuredTTL = 6 * time.Hour    // 首页名篇（无索引时是全表 filesort）
 	rangeTTL    = 6 * time.Hour    // 已发布主键区间（随机/每日取词）
+	titleTTL    = 30 * time.Minute // 按诗名取全篇（开放 API，命中即零回源）
 )
+
+// 随机池参数：池越大回源越少，但占用内存与填充耗时越多。
+const randomPoolSize = 64 // 一次回源（采样 64 个随机起点）可支撑的请求数
 
 // ── 连接 ───────────────────────────────────────────────
 
@@ -344,6 +355,13 @@ func open(d dialect, dsn string) (*Store, error) {
 	s.metaCache = memo.New[string, []string]("meta", metaTTL, 8, 0, nil)
 	s.statsCache = memo.New[string, Stats]("stats", statsTTL, 1, 0, nil)
 	s.rangeCache = memo.New[string, [2]int64]("idrange", rangeTTL, 1, 0, nil)
+	s.titleCache = memo.New[string, model.Poem]("title", titleTTL, 512, 0, nil)
+	s.randPoemPool = newPool[model.Poem]("rand-poem", func() []model.Poem {
+		return s.samplePoems(randomPoolSize)
+	})
+	s.randLinePool = newPool[RandomLineResult]("rand-line", func() []RandomLineResult {
+		return s.sampleLines(randomPoolSize)
+	})
 	s.fulltext = s.detectFulltext()
 	if !s.fulltext && d.fulltextIndex != "" {
 		// 自建库补齐 ngram 全文索引；不支持时静默降级为 LIKE
@@ -765,13 +783,198 @@ func (s *Store) poemAtOrAfter(target int64) (model.Poem, error) {
 	return m, err
 }
 
-// RandomPoem 随机一首。
-func (s *Store) RandomPoem() (model.Poem, error) {
-	lo, hi, err := s.idRange()
+// RandomPoem 随机一首：从随机池取（池见下），命中即零数据库往返。
+func (s *Store) RandomPoem() (model.Poem, error) { return s.randPoemPool.take() }
+
+// GetPoemByTitle 按诗名取一首：先精确匹配 title（同名时取 id 最小的一首），
+// 未命中再退化为包含匹配，便于「静夜思」这类带前后缀的写法也能查到。
+// author 非空时用于消歧（同一诗题可能有多位作者的作品）。
+// 结果按「诗名+作者」缓存（含「查无此诗」的负结果，避免重复回源）。
+func (s *Store) GetPoemByTitle(title, author string) (model.Poem, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return model.Poem{}, ErrNotFound
+	}
+	author = strings.TrimSpace(author)
+	m, err := s.titleCache.Get(title+"\x00"+author, func() (model.Poem, error) {
+		m, err := s.queryPoemByTitle(title, author)
+		if errors.Is(err, ErrNotFound) {
+			return model.Poem{}, nil // 零值即「查无此诗」，同样入缓存
+		}
+		return m, err
+	})
 	if err != nil {
 		return model.Poem{}, err
 	}
-	return s.poemAtOrAfter(lo + rand.Int63n(hi-lo+1))
+	if m.ID == 0 {
+		return model.Poem{}, ErrNotFound
+	}
+	return m, nil
+}
+
+// queryPoemByTitle 实际查询（缓存未命中时调用）。
+func (s *Store) queryPoemByTitle(title, author string) (model.Poem, error) {
+	cond := []string{publishedCond}
+	base := []any{}
+	if author != "" {
+		cond = append(cond, `p.author = ?`)
+		base = append(base, author)
+	}
+	query := func(match string, val any) (model.Poem, error) {
+		c := append(append([]string{}, cond...), match)
+		a := append(append([]any{}, base...), val)
+		row := s.db.QueryRow(`SELECT `+poemCols+` FROM poems p WHERE `+
+			strings.Join(c, " AND ")+` ORDER BY p.id LIMIT 1`, a...)
+		m, err := scanPoem(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Poem{}, ErrNotFound
+		}
+		return m, err
+	}
+	m, err := query(`p.title = ?`, title)
+	if errors.Is(err, ErrNotFound) {
+		return query(`p.title LIKE ?`, like(title)) // 包含匹配兜底
+	}
+	return m, err
+}
+
+// RandomLineResult 随机一句的结果：句子 + 所属作品。
+type RandomLineResult struct {
+	Poem model.Poem
+	Line string
+}
+
+// RandomLine 随机一句：从随机句池取（池见下），命中即零数据库往返。
+func (s *Store) RandomLine() (RandomLineResult, error) { return s.randLinePool.take() }
+
+// ── 随机池（前置缓存） ────────────────────────────────
+//
+// 随机结果不能按 URI 缓存（否则每次都返回同一首），这里用「批量回源 + 逐个消费」：
+// 一次回源在主键区间上取多个随机起点、各取一小段，打散后作为候选池；
+// 之后每个请求只从池里取一个，余量不足时后台异步补一批。
+// 效果：连续请求不重复、分布仍覆盖全库，而数据库往返降为每池一次（约 1/64）。
+// 池已登记到 memo，后台写入 / SIGUSR1 清空缓存时一并失效。
+type pool[T any] struct {
+	name    string
+	fill    func() []T
+	mu      sync.Mutex
+	items   []T
+	next    int
+	filling bool // 是否已有 goroutine 在补池
+}
+
+func newPool[T any](name string, fill func() []T) *pool[T] {
+	p := &pool[T]{name: name, fill: fill}
+	memo.Register(p)
+	return p
+}
+
+func (p *pool[T]) Name() string { return p.name }
+
+// Flush 清空池（下次请求会同步回源重新填充）。
+func (p *pool[T]) Flush() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.items, p.next = nil, 0
+}
+
+// take 取一个候选：池空时同步填充；余量不足一半时后台异步补一批。
+func (p *pool[T]) take() (T, error) {
+	var zero T
+
+	p.mu.Lock()
+	if p.next < len(p.items) {
+		v := p.items[p.next]
+		p.next++
+		async := !p.filling && len(p.items)-p.next < len(p.items)/2
+		if async {
+			p.filling = true
+		}
+		p.mu.Unlock()
+		if async {
+			go p.refill()
+		}
+		return v, nil
+	}
+	p.mu.Unlock()
+
+	items := p.fill()
+	if len(items) == 0 {
+		return zero, ErrNotFound
+	}
+	p.mu.Lock()
+	p.items, p.next = items, 1
+	p.mu.Unlock()
+	return items[0], nil
+}
+
+// refill 后台补一批：成功后整池替换（丢弃未消费的余量，保证新鲜度）。
+func (p *pool[T]) refill() {
+	items := p.fill()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.filling = false
+	if len(items) > 0 {
+		p.items, p.next = items, 0
+	}
+}
+
+// samplePoems 批量采样：每个随机起点只取 1 首——若一次取连续多首，
+// 池内 id 会相邻（常是同一作品的连章），随机性明显变差。
+// 4 路并发只为缩短填充耗时（填充走后台，不阻塞请求）。
+func (s *Store) samplePoems(limit int) []model.Poem {
+	lo, hi, err := s.idRange()
+	if err != nil {
+		return nil
+	}
+	const workers = 4
+	perWorker := (limit + workers - 1) / workers
+
+	var (
+		wg  sync.WaitGroup
+		mu  sync.Mutex
+		out = make([]model.Poem, 0, limit)
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				m, err := s.poemAtOrAfter(lo + rand.Int63n(hi-lo+1))
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				out = append(out, m)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// sampleLines 批量采样句子：每首诗随机挑一句（同一首不在池里重复出现），再打散。
+func (s *Store) sampleLines(limit int) []RandomLineResult {
+	poems := s.samplePoems(limit)
+	out := make([]RandomLineResult, 0, limit)
+	for _, m := range poems {
+		lines := m.Lines()
+		if len(lines) == 0 {
+			continue
+		}
+		out = append(out, RandomLineResult{Poem: m, Line: lines[rand.Intn(len(lines))]})
+	}
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
 }
 
 // DailyPoem 今日诗词：按日期确定性挑选（一天内稳定，跨天轮换）。
@@ -1036,7 +1239,9 @@ func (s *Store) Warmup() {
 	s.Dynasties()
 	s.Genres()
 	_, _ = s.ListPoets("", "")
-	_, _, _ = s.ListPoems(Filter{Page: 1, PageSize: 12})
+	_, 	_, _ = s.ListPoems(Filter{Page: 1, PageSize: 12})
+	_, _ = s.RandomPoem() // 预热随机池：填充后前 64 次随机请求零回源
+	_, _ = s.RandomLine()
 	log.Printf("[cache] 启动预热完成")
 }
 

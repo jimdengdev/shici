@@ -1,7 +1,7 @@
 // shici —— 公益中国诗词网站
 //
 // 前台：/（今日诗词）、/poems（关键词+诗人检索）、/poets、/poems/{id}、/random、/about
-// API ：/api/poems、/api/poets、/api/search?q=…
+// API ：/api/random（随机整首）、/api/random/line（随机一句）、/api/poem?title=…（按诗名取全篇）
 // 后台：/admin（账号由 ADMIN_USER / ADMIN_PASS（或 ADMIN_HASH）配置）
 //
 // 配置优先从环境变量读取；未设置时自动加载同目录 .env（.env 已被 .gitignore 忽略）。
