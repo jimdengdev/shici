@@ -19,19 +19,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-sql-driver/mysql" // MySQL 驱动（纯 Go）
 	_ "modernc.org/sqlite"           // 纯 Go SQLite 驱动
 
 	"shici/data"
+	"shici/internal/memo"
 	"shici/internal/model"
 )
 
@@ -93,9 +94,26 @@ CREATE TABLE IF NOT EXISTS poems (
   KEY idx_poems_category (category),
   KEY idx_poems_status (status),
   KEY idx_poems_featured (featured, created_at),
-  KEY idx_poems_author (author)
+  KEY idx_poems_author (author),
+  KEY idx_poems_status_id (status, id),
+  KEY idx_poems_status_dynasty_id (status, dynasty, id),
+  KEY idx_poems_status_category_id (status, category, id),
+  KEY idx_poems_status_featured_id (status, featured, id),
+  KEY idx_poems_author_id (author, id),
+  KEY idx_poems_status_author_dynasty (status, author, dynasty)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='古诗词表'
 `
+
+// mysqlIndexes 站点查询依赖的复合索引：新库由 DDL 直接建好，
+// 已存在的库（多为历史库）启动时按需补建，避免列表页 ORDER BY 触发全表 filesort。
+var mysqlIndexes = []struct{ name, spec string }{
+	{"idx_poems_status_id", "(status, id)"},
+	{"idx_poems_status_dynasty_id", "(status, dynasty, id)"},
+	{"idx_poems_status_category_id", "(status, category, id)"},
+	{"idx_poems_status_featured_id", "(status, featured, id)"},
+	{"idx_poems_author_id", "(author, id)"},
+	{"idx_poems_status_author_dynasty", "(status, author, dynasty)"},
+}
 
 // dialect 方言差异：驱动、DDL、连接池与旧表兼容策略。
 type dialect struct {
@@ -151,22 +169,25 @@ type Store struct {
 	d        dialect
 	fulltext bool // 是否可用 ngram 全文索引
 
-	// 元数据/统计缓存：DISTINCT 与 COUNT(*) 在 34 万行上开销较大，短 TTL 缓存
-	metaMu   sync.Mutex
-	meta     map[string]memoEntry
-	statsMu  sync.Mutex
-	statsVal Stats
-	statsAt  time.Time
+	// 进程内缓存（internal/memo）：内容型站点数据极少变化，
+	// 采用「长 TTL + 写入失效（invalidateMeta）+ SIGUSR1 清空」。
+	// 1C1G 远端 MySQL 下 COUNT(*) / GROUP BY / filesort 都是全表级开销，逐个说明：
+	countCache *memo.Cache[string, int]          // 检索总数 COUNT(*)
+	poetCache  *memo.Cache[string, []model.Poet] // 诗人榜 GROUP BY author
+	featCache  *memo.Cache[int, []model.Poem]    // 首页名篇 ORDER BY featured
+	metaCache  *memo.Cache[string, []string]     // 朝代/体裁 DISTINCT
+	statsCache *memo.Cache[string, Stats]        // 后台统计
+	rangeCache *memo.Cache[string, [2]int64]     // 已发布主键区间 MIN/MAX
 }
 
-type memoEntry struct {
-	val []string
-	at  time.Time
-}
-
+// 缓存 TTL：按数据变动频率设定；后台写入会立即失效，SIGUSR1 可全量清空。
 const (
-	metaTTL  = 10 * time.Minute // 朝代/体裁列表
-	statsTTL = time.Minute      // 收录统计
+	metaTTL     = 24 * time.Hour   // 朝代/体裁列表
+	statsTTL    = 6 * time.Hour    // 收录统计
+	countTTL    = 30 * time.Minute // 检索结果总数（只影响分页展示）
+	poetTTL     = 12 * time.Hour   // 诗人榜（GROUP BY author 全表聚合）
+	featuredTTL = 6 * time.Hour    // 首页名篇（无索引时是全表 filesort）
+	rangeTTL    = 6 * time.Hour    // 已发布主键区间（随机/每日取词）
 )
 
 // ── 连接 ───────────────────────────────────────────────
@@ -290,7 +311,8 @@ func open(d dialect, dsn string) (*Store, error) {
 	db.SetMaxOpenConns(d.maxOpen)
 	db.SetMaxIdleConns(d.maxOpen)
 	if d.maxOpen > 1 {
-		db.SetConnMaxLifetime(time.Hour) // 连接池防陈旧连接（MySQL）
+		db.SetConnMaxLifetime(time.Hour)       // 连接池防陈旧连接（MySQL）
+		db.SetConnMaxIdleTime(5 * time.Minute) // 空闲连接及时归还，1C1G 小库不常驻占用
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
@@ -316,6 +338,12 @@ func open(d dialect, dsn string) (*Store, error) {
 		}
 	}
 	s := &Store{db: db, d: d}
+	s.countCache = memo.New[string, int]("count", countTTL, 256, 0, nil)
+	s.poetCache = memo.New[string, []model.Poet]("poets", poetTTL, 32, 0, nil)
+	s.featCache = memo.New[int, []model.Poem]("featured", featuredTTL, 16, 0, nil)
+	s.metaCache = memo.New[string, []string]("meta", metaTTL, 8, 0, nil)
+	s.statsCache = memo.New[string, Stats]("stats", statsTTL, 1, 0, nil)
+	s.rangeCache = memo.New[string, [2]int64]("idrange", rangeTTL, 1, 0, nil)
 	s.fulltext = s.detectFulltext()
 	if !s.fulltext && d.fulltextIndex != "" {
 		// 自建库补齐 ngram 全文索引；不支持时静默降级为 LIKE
@@ -324,11 +352,35 @@ func open(d dialect, dsn string) (*Store, error) {
 			s.fulltext = s.detectFulltext()
 		}
 	}
+	if d.driver == "mysql" {
+		// 历史库缺失的复合索引按需补建（只读账号/无 ALTER 权限时静默跳过）
+		ensureIndexes(db)
+	}
 	if err := s.seedIfEmpty(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// ensureIndexes 为已存在的 poems 表补建列表页/诗人榜所需的复合索引。
+// 逐条检查 information_schema.statistics，已存在即跳过；失败只记日志不阻断启动
+// （只读账号没有 ALTER 权限时站点仍可运行，只是分页会走全表排序）。
+func ensureIndexes(db *sql.DB) {
+	for _, idx := range mysqlIndexes {
+		var n int
+		err := db.QueryRow(`SELECT COUNT(*) FROM information_schema.statistics
+			WHERE table_schema = DATABASE() AND table_name = 'poems' AND index_name = ?`,
+			idx.name).Scan(&n)
+		if err != nil || n > 0 {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE poems ADD INDEX ` + idx.name + ` ` + idx.spec); err != nil {
+			log.Printf("[db] 补建索引 %s 失败（账号可能无 ALTER 权限）: %v", idx.name, err)
+			continue
+		}
+		log.Printf("[db] 已补建索引 %s %s", idx.name, idx.spec)
+	}
 }
 
 // detectFulltext 探测 ngram 全文索引是否可用（索引存在且列集合匹配）。
@@ -582,8 +634,14 @@ func (s *Store) ListPoems(f Filter) ([]model.Poem, int, error) {
 	}
 	where, args, order, orderArgs := s.clauses(&f)
 
-	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems p`+where, args...).Scan(&total); err != nil {
+	total, err := s.countCache.Get(countKey(where, args), func() (int, error) {
+		var n int
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems p`+where, args...).Scan(&n); err != nil {
+			return 0, err
+		}
+		return n, nil
+	})
+	if err != nil {
 		return nil, 0, err
 	}
 
@@ -616,17 +674,23 @@ func collectPoems(rows *sql.Rows) ([]model.Poem, error) {
 }
 
 // FeaturedPoems 首页「名篇撷英」：精选优先，不足按主键顺序补足。
+// 复合索引未建好时该查询是全表 filesort，首页每次访问都会命中，故长 TTL 缓存。
 func (s *Store) FeaturedPoems(limit int) []model.Poem {
 	if limit < 1 || limit > 50 {
 		limit = 8
 	}
-	rows, err := s.db.Query(`SELECT `+poemCols+` FROM poems p WHERE `+publishedCond+
-		` ORDER BY p.featured DESC, p.id LIMIT ?`, limit)
+	list, err := s.featCache.Get(limit, func() ([]model.Poem, error) {
+		rows, err := s.db.Query(`SELECT `+poemCols+` FROM poems p WHERE `+publishedCond+
+			` ORDER BY p.featured DESC, p.id LIMIT ?`, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return collectPoems(rows)
+	})
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
-	list, _ := collectPoems(rows)
 	return list
 }
 
@@ -669,16 +733,20 @@ func (s *Store) PrevNext(id int64) (prev, next *model.Poem) {
 }
 
 // idRange 已发布作品的主键区间，用于随机/每日取词（避免 ORDER BY RAND() 全表排序）。
+// 区间在数据量不变时是稳定的，缓存 6 小时；后台写入会立即失效。
 func (s *Store) idRange() (int64, int64, error) {
-	var lo, hi sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MIN(id), MAX(id) FROM poems p WHERE `+publishedCond).
-		Scan(&lo, &hi); err != nil {
-		return 0, 0, err
-	}
-	if !lo.Valid || !hi.Valid {
-		return 0, 0, ErrNotFound
-	}
-	return lo.Int64, hi.Int64, nil
+	r, err := s.rangeCache.Get("range", func() ([2]int64, error) {
+		var lo, hi sql.NullInt64
+		if err := s.db.QueryRow(`SELECT MIN(id), MAX(id) FROM poems p WHERE `+publishedCond).
+			Scan(&lo, &hi); err != nil {
+			return [2]int64{}, err
+		}
+		if !lo.Valid || !hi.Valid {
+			return [2]int64{}, ErrNotFound
+		}
+		return [2]int64{lo.Int64, hi.Int64}, nil
+	})
+	return r[0], r[1], err
 }
 
 // poemAtOrAfter 取 id >= target 的第一首（越过末尾则回退到最早一首）。
@@ -731,43 +799,47 @@ const poetLimit = 300
 
 // ListPoets 诗人列表（含作品数），支持姓名关键词与朝代过滤。
 func (s *Store) ListPoets(keyword, dynasty string) ([]model.Poet, error) {
-	var conds []string
-	var args []any
-	if q := strings.TrimSpace(keyword); q != "" {
-		conds = append(conds, `p.author LIKE ?`)
-		args = append(args, like(q))
-	}
-	if v := strings.TrimSpace(dynasty); v != "" {
-		conds = append(conds, `p.dynasty = ?`)
-		args = append(args, v)
-	}
-	conds = append(conds, publishedCond)
+	// 全库数十万行做 GROUP BY 聚合，结果按关键词/朝代缓存，避免每次访问都重扫
+	key := strings.TrimSpace(keyword) + "\x00" + strings.TrimSpace(dynasty)
+	return s.poetCache.Get(key, func() ([]model.Poet, error) {
+		var conds []string
+		var args []any
+		if q := strings.TrimSpace(keyword); q != "" {
+			conds = append(conds, `p.author LIKE ?`)
+			args = append(args, like(q))
+		}
+		if v := strings.TrimSpace(dynasty); v != "" {
+			conds = append(conds, `p.dynasty = ?`)
+			args = append(args, v)
+		}
+		conds = append(conds, publishedCond)
 
-	q := `SELECT p.author, p.dynasty, COUNT(*) AS cnt
-	      FROM poems p WHERE ` + strings.Join(conds, " AND ") + `
-	      GROUP BY p.author, p.dynasty
-	      ORDER BY cnt DESC, p.author
-	      LIMIT ?`
-	args = append(args, poetLimit)
+		q := `SELECT p.author, p.dynasty, COUNT(*) AS cnt
+		      FROM poems p WHERE ` + strings.Join(conds, " AND ") + `
+		      GROUP BY p.author, p.dynasty
+		      ORDER BY cnt DESC, p.author
+		      LIMIT ?`
+		args = append(args, poetLimit)
 
-	rows, err := s.db.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var list []model.Poet
-	for rows.Next() {
-		var p model.Poet
-		var cnt int
-		if err := rows.Scan(&p.Name, &p.Dynasty, &cnt); err != nil {
+		rows, err := s.db.Query(q, args...)
+		if err != nil {
 			return nil, err
 		}
-		p.PoemCount = cnt
-		p.Intro = poetIntros[p.Name]
-		list = append(list, p)
-	}
-	return list, rows.Err()
+		defer rows.Close()
+
+		var list []model.Poet
+		for rows.Next() {
+			var p model.Poet
+			var cnt int
+			if err := rows.Scan(&p.Name, &p.Dynasty, &cnt); err != nil {
+				return nil, err
+			}
+			p.PoemCount = cnt
+			p.Intro = poetIntros[p.Name]
+			list = append(list, p)
+		}
+		return list, rows.Err()
+	})
 }
 
 // GetPoet 按姓名取诗人（同名跨朝代时取作品最多者）。
@@ -919,45 +991,57 @@ func (s *Store) DeletePoem(id int64) error {
 // ── 元数据 / 统计 ──────────────────────────────────────
 
 func (s *Store) distinct(col string) []string {
-	s.metaMu.Lock()
-	if e, ok := s.meta[col]; ok && time.Since(e.at) < metaTTL {
-		s.metaMu.Unlock()
-		return e.val
-	}
-	s.metaMu.Unlock()
-
-	rows, err := s.db.Query(`SELECT DISTINCT ` + col + ` FROM poems p WHERE ` + publishedCond +
-		` AND ` + col + ` <> '' ORDER BY ` + col)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var v string
-		if rows.Scan(&v) == nil {
-			out = append(out, v)
+	v, err := s.metaCache.Get(col, func() ([]string, error) {
+		rows, err := s.db.Query(`SELECT DISTINCT ` + col + ` FROM poems p WHERE ` + publishedCond +
+			` AND ` + col + ` <> '' ORDER BY ` + col)
+		if err != nil {
+			return nil, err
 		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var v string
+			if rows.Scan(&v) == nil {
+				out = append(out, v)
+			}
+		}
+		return out, rows.Err()
+	})
+	if err != nil {
+		return nil // 与旧行为一致：查询失败不阻断页面
 	}
-
-	s.metaMu.Lock()
-	if s.meta == nil {
-		s.meta = make(map[string]memoEntry, 2)
-	}
-	s.meta[col] = memoEntry{val: out, at: time.Now()}
-	s.metaMu.Unlock()
-	return out
+	return v
 }
 
-// invalidateMeta 写入数据后清空缓存（朝代/体裁/统计）。
-func (s *Store) invalidateMeta() {
-	s.metaMu.Lock()
-	s.meta = nil
-	s.metaMu.Unlock()
-	s.statsMu.Lock()
-	s.statsAt = time.Time{}
-	s.statsMu.Unlock()
+// countKey 检索条件 → 缓存键（args 均为字符串，直接拼接即可）。
+func countKey(where string, args []any) string {
+	var b strings.Builder
+	b.WriteString(where)
+	for _, a := range args {
+		b.WriteByte(0)
+		fmt.Fprint(&b, a)
+	}
+	return b.String()
 }
+
+// InvalidateCache 清空全部进程内缓存（含页面缓存）。
+// 触发方式：后台写入（自动）、批量导入后 `systemctl kill -s SIGUSR1 shici`（手动）。
+func (s *Store) InvalidateCache() { memo.FlushAll() }
+
+// Warmup 启动预热：把首页/列表/诗人榜等高频数据提前填入缓存，
+// 避免冷启动的第一个访问者承担全部回源耗时。
+func (s *Store) Warmup() {
+	s.FeaturedPoems(8)
+	_, _ = s.Stats()
+	s.Dynasties()
+	s.Genres()
+	_, _ = s.ListPoets("", "")
+	_, _, _ = s.ListPoems(Filter{Page: 1, PageSize: 12})
+	log.Printf("[cache] 启动预热完成")
+}
+
+// invalidateMeta 写入数据后清空全部缓存（数据 + 页面）。
+func (s *Store) invalidateMeta() { memo.FlushAll() }
 
 // Dynasties 诗词涉及的朝代列表。
 func (s *Store) Dynasties() []string { return s.distinct("p.dynasty") }
@@ -980,41 +1064,30 @@ type Count struct {
 
 // Stats 返回统计信息（statsTTL 内复用，避免每次全表 COUNT）。
 func (s *Store) Stats() (Stats, error) {
-	s.statsMu.Lock()
-	if !s.statsAt.IsZero() && time.Since(s.statsAt) < statsTTL {
-		cached := s.statsVal
-		s.statsMu.Unlock()
-		return cached, nil
-	}
-	s.statsMu.Unlock()
-
-	var st Stats
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems p WHERE ` + publishedCond).
-		Scan(&st.Poems); err != nil {
-		return st, err
-	}
-	if err := s.db.QueryRow(`SELECT COUNT(DISTINCT author) FROM poems p WHERE ` + publishedCond).
-		Scan(&st.Poets); err != nil {
-		return st, err
-	}
-	rows, err := s.db.Query(`SELECT p.dynasty, COUNT(*) FROM poems p WHERE ` + publishedCond +
-		` AND p.dynasty <> '' GROUP BY p.dynasty ORDER BY COUNT(*) DESC`)
-	if err == nil {
-		for rows.Next() {
-			var c Count
-			if rows.Scan(&c.Label, &c.N) == nil {
-				st.ByDynasty = append(st.ByDynasty, c)
-			}
+	return s.statsCache.Get("stats", func() (Stats, error) {
+		var st Stats
+		if err := s.db.QueryRow(`SELECT COUNT(*) FROM poems p WHERE ` + publishedCond).
+			Scan(&st.Poems); err != nil {
+			return st, err
 		}
-		rows.Close()
-	}
-	st.Recent = s.recentPoems(6)
-
-	s.statsMu.Lock()
-	s.statsVal = st
-	s.statsAt = time.Now()
-	s.statsMu.Unlock()
-	return st, nil
+		if err := s.db.QueryRow(`SELECT COUNT(DISTINCT author) FROM poems p WHERE ` + publishedCond).
+			Scan(&st.Poets); err != nil {
+			return st, err
+		}
+		rows, err := s.db.Query(`SELECT p.dynasty, COUNT(*) FROM poems p WHERE ` + publishedCond +
+			` AND p.dynasty <> '' GROUP BY p.dynasty ORDER BY COUNT(*) DESC`)
+		if err == nil {
+			for rows.Next() {
+				var c Count
+				if rows.Scan(&c.Label, &c.N) == nil {
+					st.ByDynasty = append(st.ByDynasty, c)
+				}
+			}
+			rows.Close()
+		}
+		st.Recent = s.recentPoems(6)
+		return st, nil
+	})
 }
 
 // AtoiID 安全解析 ID。

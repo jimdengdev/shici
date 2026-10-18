@@ -22,21 +22,22 @@ func Register(app *iris.Application, st *store.Store) {
 	app.RegisterView(tmpl)
 	app.HandleDir("/static", Static())
 
-	// 页面
-	app.Get("/", home(st))
-	app.Get("/poems", listPoems(st))
-	app.Get("/poems/{id:int64}", poemDetail(st))
-	app.Get("/poets", listPoets(st))
-	app.Get("/poets/{name:string}", poetDetail(st))
-	app.Get("/random", random(st))
-	app.Get("/about", about)
+	// 页面（挂页面缓存中间件：命中直接回 HTML，后台写入/SIGUSR1 会清空）
+	pc := PageCache()
+	app.Get("/", pc, home(st))
+	app.Get("/poems", pc, listPoems(st))
+	app.Get("/poems/{id:int64}", pc, poemDetail(st))
+	app.Get("/poets", pc, listPoets(st))
+	app.Get("/poets/{name:string}", pc, poetDetail(st))
+	app.Get("/about", pc, about)
+	app.Get("/random", random(st)) // 每次随机跳转，不缓存
 
-	// JSON API
-	app.Get("/api/poems", apiListPoems(st))
-	app.Get("/api/poems/{id:int64}", apiPoem(st))
-	app.Get("/api/poets", apiListPoets(st))
-	app.Get("/api/poets/{name:string}", apiPoet(st))
-	app.Get("/api/search", apiListPoems(st)) // /api/search?q=... 别名
+	// JSON API（同样按 URI 缓存）
+	app.Get("/api/poems", pc, apiListPoems(st))
+	app.Get("/api/poems/{id:int64}", pc, apiPoem(st))
+	app.Get("/api/poets", pc, apiListPoets(st))
+	app.Get("/api/poets/{name:string}", pc, apiPoet(st))
+	app.Get("/api/search", pc, apiListPoems(st)) // /api/search?q=... 别名
 }
 
 // render 公共渲染：默认布局 + 公共导航数据。

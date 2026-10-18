@@ -13,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/kataras/iris/v12"
 
@@ -92,6 +94,19 @@ func main() {
 	if st.ReadOnly() {
 		log.Printf("注意：当前数据库账号只有读权限（SELECT），后台的新增/修改/删除将失败")
 	}
+
+	// SIGUSR1：手动清空全部缓存。批量导入数据后执行：
+	//   systemctl kill -s SIGUSR1 shici
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGUSR1)
+	go func() {
+		for range sigCh {
+			st.InvalidateCache()
+		}
+	}()
+
+	// 启动预热：提前填充首页/列表/诗人榜缓存，冷启动的访问者不再承担回源耗时
+	go st.Warmup()
 
 	app := iris.New()
 	// 把 HEAD 当作 GET 路由处理（Iris 只为 GET 注册路由，否则健康检查/监控的

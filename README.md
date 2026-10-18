@@ -174,6 +174,55 @@ sudo systemctl daemon-reload && sudo systemctl restart caddy
 - 验证：`curl -I http://<站点>`（HEAD 也返回 200）、`nc -z <站点> <应用端口>` 应失败
 - 日志：应用 `journalctl -u shici -f`，访问日志 `/var/log/caddy/shici-access.log`
 
+## MySQL 优化（1 核 1G / 20G）
+
+34 万行数据在 1C1G 上跑 MySQL，瓶颈几乎都在「列表页排序」与「全表聚合」，按下面两步做即可稳定。
+
+```bash
+# 1. 补建复合索引（幂等，可重复执行；需要 poems 表的 ALTER 权限）
+mysql -u<用户> -p poetry_charity < deploy/mysql-optimize.sql
+
+# 2. 应用 MySQL 参数模板（1Panel：容器 → 参数 → 配置文件；系统包：/etc/mysql/mysql.conf.d/）
+sudo cp deploy/mysql-1c1g.cnf /etc/mysql/mysql.conf.d/zz-1c1g.cnf
+sudo systemctl restart mysql
+```
+
+> 云数据库（腾讯云 CynosDB / RDS 等）无法直接改 `my.cnf`：在控制台「参数设置 / 参数组」里按 `deploy/mysql-1c1g.cnf` 的键值逐项调整。应用账号只有 `SELECT/INSERT/UPDATE/DELETE` 时无法加索引（`ALTER command denied`），需用具备 ALTER 权限的账号执行上面的 SQL。
+
+做了什么：
+
+- **复合索引**：`(status, id)` / `(status, dynasty, id)` / `(status, category, id)` / `(status, featured, id)` / `(author, id)` / `(status, author, dynasty)`。列表页固定 `WHERE status='published' ORDER BY id`，只有单列 `idx_poems_status` 时会退化成「全表取 + filesort + 临时表」，这也是 CPU 打满的主因；补上后分页变成索引顺序扫描，`LIMIT/OFFSET` 不再排序
+- **缓冲池**：`innodb_buffer_pool_size=256M`（1G 机器约 25%，留足给应用与系统），热数据命中内存后磁盘 IO 与 CPU 都明显下降
+- **关闭 `performance_schema`**：1G 机器可省 100~300M 常驻内存；问题排查交给慢日志（`long_query_time=1`）
+- **`innodb_flush_log_at_trx_commit=2`**：崩溃最多丢 1 秒事务，换写入吞吐；对数据安全性要求高时改回 `1`
+- **应用侧**：检索总数（`COUNT(*)`）缓存 30s、诗人榜（`GROUP BY author`）缓存 5 分钟，后台写入时自动失效；MySQL 连接池空闲 5 分钟后归还
+
+验证：
+
+```sql
+SHOW INDEX FROM poems;                       -- 六个复合索引齐全
+EXPLAIN SELECT id FROM poems WHERE status='published' ORDER BY id LIMIT 20;
+-- 期望 key = idx_poems_status_id，且 Extra 中没有 Using filesort / Using temporary
+```
+
+> 说明：全文检索依赖 `ft_poems_search`（ngram），单字关键词仍会降级 `LIKE '%词%'` 全表扫描，这是预期行为，短关键词请尽量少用。
+
+### 缓存（内容极少变化，长 TTL + 事件失效）
+
+两层进程内缓存（`internal/memo`，TTL 带抖动、单飞回源、过期先返回旧值再后台刷新）：
+
+| 层 | 内容 | TTL |
+|---|---|---|
+| 数据层 | 朝代/体裁 24h · 统计 6h · 诗人榜 12h · 首页名篇 6h · 主键区间 6h · 检索总数 30min | 见 `store.go` |
+| 页面层 | 渲染后的 HTML/JSON（按 URI，30min，32MiB LRU） | `internal/web/cache.go` |
+
+- 命中情况看响应头 `X-Cache: HIT/MISS`
+- 后台增删改会立即清空全部缓存；批量导入数据后手动清：
+
+```bash
+systemctl kill -s SIGUSR1 shici
+```
+
 ## 部署提示
 
 - 单二进制 + SQLite 文件即可运行，适合小内存 VPS / 容器
