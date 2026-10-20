@@ -50,7 +50,7 @@ ADMIN_PASS=你的后台密码
 - **诗人没有独立表**：`/poets` 由 `poems.author + dynasty` 聚合派生（按作品数排序，最多 300 位），诗人小传取自内置的 51 位名家小传；后台「诗人管理」的编辑即批量改写其作品的作者/朝代
 - 首次连接自动建表（`IF NOT EXISTS`，不会影响已有数据）；库为空时灌入内置种子数据
 - 已兼容远端表上的唯一键 `uk_poems_dedup(dynasty,title,author)`：重复作品保存会报错
-- 环境变量：`PORT`、`SHICI_HOST`（监听地址，置于反向代理后设为 `127.0.0.1`）、`SHICI_COOKIE_SECURE`（HTTPS 部署设为 `1`，会话 Cookie 带 `Secure`）、`SHICI_DB`（SQLite 路径）、`SHICI_MYSQL_DSN` / `SHICI_MYSQL_DB`（二选一）、`ADMIN_USER` / `ADMIN_PASS` / `ADMIN_HASH`
+- 环境变量：`PORT`、`SHICI_HOST`（监听地址，置于反向代理后设为 `127.0.0.1`）、`SHICI_SITE_URL`（对外站点地址，用于 canonical / sitemap；不设则按请求头推断）、`SHICI_COOKIE_SECURE`（HTTPS 部署设为 `1`，会话 Cookie 带 `Secure`）、`SHICI_DB`（SQLite 路径）、`SHICI_MYSQL_DSN` / `SHICI_MYSQL_DB`（二选一）、`ADMIN_USER` / `ADMIN_PASS` / `ADMIN_HASH`
 - 配置来源：优先环境变量，未设置时自动加载同目录 `.env`（`SHICI_ENV_FILE` 可指定其他路径）
 - 数据库权限：`poems` 表已存在时不再执行任何 DDL，**只读账号（仅 SELECT）即可运行前台**；后台维护需要 `INSERT/UPDATE`，若账号只读，启动日志会打印提示，后台保存返回数据库的权限错误
 - **删除即改状态**：后台「删除」不做物理 `DELETE`，而是把 `status` 置为 `archived`；站点只展示 `published`，`archived` 记录保留在库中但不再出现在列表、详情、检索与统计里（需要时可把 `status` 改回 `published` 恢复）
@@ -65,6 +65,9 @@ ADMIN_PASS=你的后台密码
 | `/poets` `/poets/{name}` | 诗人检索（姓名/朝代）、小传与作品（最多 200 首） |
 | `/random` | 随机跳转一首 |
 | `/about` | 公益说明与 API 文档 |
+| `/robots.txt` | 爬虫规则（屏蔽后台/API） |
+| `/sitemap.xml` | sitemap 索引（页面 / 诗人 / 诗词分片，每片 45k） |
+| `/healthz` | 健康检查（返回 `ok`） |
 
 ## 开放 API（JSON）
 
@@ -105,6 +108,8 @@ curl 'http://localhost:8080/api/poem?title=%E9%9D%99%E5%A4%9C%E6%80%9D'
 - **诗人派生**：无诗人表，`author` 聚合出诗人列表与作品数；诗人详情路由以姓名作为标识
 - **元数据缓存**：朝代/体裁列表（10 分钟）与收录统计（1 分钟）短 TTL 缓存，写操作后立即失效
 - **零外部资源**：模板、样式全部 `go:embed` 内嵌，单二进制部署；古典水墨风 CSS
+- **SEO**：每页独立 description / canonical / OG 标签，诗词详情页输出 schema.org JSON-LD；筛选与分页页 `noindex`；`robots.txt` + 分片 `sitemap.xml`（34 万作品按 45k 自动分片）
+- **安全**：后台 CSRF 令牌、登录限流、常量时间口令比较；应用层输出 `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy`
 - **静态资源长缓存**：按内容哈希生成 ETag 与 `?v=<版本>`，浏览器可缓存一年（`immutable`）
 - 今日诗词按日期确定性轮换（同一天稳定、跨天更换）；随机/每日取词用主键区间采样，避免 `ORDER BY RAND()` 全表排序
 

@@ -4,7 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ if .Title }}{{ .Title }} · {{ end }}诗词雅集</title>
-  <meta name="description" content="公益中国诗词站点：免费检索、阅读中国古典诗词名篇。">
+  <meta name="description" content="{{ .Description }}">
+  <link rel="canonical" href="{{ .Canonical }}">
+  {{ if .NoIndex }}<meta name="robots" content="noindex,follow">{{ end }}
+  <meta property="og:type" content="{{ .OGType }}">
+  <meta property="og:site_name" content="{{ .SiteName }}">
+  <meta property="og:title" content="{{ if .Title }}{{ .Title }} · {{ end }}{{ .SiteName }}">
+  <meta property="og:description" content="{{ .Description }}">
+  <meta property="og:url" content="{{ .Canonical }}">
+  <meta name="twitter:card" content="summary">
+  {{ if .JSONLD }}<script type="application/ld+json">{{ .JSONLD }}</script>{{ end }}
   <link rel="stylesheet" href="/static/style.css?v={{ .AssetVersion }}">
 </head>
 <body>

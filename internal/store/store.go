@@ -180,6 +180,7 @@ type Store struct {
 	statsCache *memo.Cache[string, Stats]        // 后台统计
 	rangeCache *memo.Cache[string, [2]int64]     // 已发布主键区间 MIN/MAX
 	titleCache *memo.Cache[string, model.Poem]   // 按诗名取全篇（开放 API）
+	poetNames  *memo.Cache[string, []model.Poet] // sitemap 用全量诗人名单
 
 	// 随机池（前置缓存）：随机结果不能按 URI 缓存，改为「批量回源 + 逐个消费」，
 	// 一次回源取一批候选，之后的请求直接从池里取，见 pool 说明。
@@ -356,6 +357,7 @@ func open(d dialect, dsn string) (*Store, error) {
 	s.statsCache = memo.New[string, Stats]("stats", statsTTL, 1, 0, nil)
 	s.rangeCache = memo.New[string, [2]int64]("idrange", rangeTTL, 1, 0, nil)
 	s.titleCache = memo.New[string, model.Poem]("title", titleTTL, 512, 0, nil)
+	s.poetNames = memo.New[string, []model.Poet]("poet-names", metaTTL, 1, 0, nil)
 	s.randPoemPool = newPool[model.Poem]("rand-poem", func() []model.Poem {
 		return s.samplePoems(randomPoolSize)
 	})
@@ -1030,6 +1032,75 @@ func (s *Store) DailyPoem() (model.Poem, error) {
 		idx += span
 	}
 	return s.poemAtOrAfter(lo + idx)
+}
+
+// sitemapChunkSize 每个 sitemap 文件包含的诗词上限（协议上限 50000）。
+const sitemapChunkSize = 45000
+
+// SitemapPoemShards 已发布作品按主键分片后的 sitemap 文件数。
+func (s *Store) SitemapPoemShards() int {
+	lo, hi, err := s.idRange()
+	if err != nil || hi < lo {
+		return 0
+	}
+	return int((hi-lo)/sitemapChunkSize) + 1
+}
+
+// SitemapPoemIDs 返回第 shard 个分片内的已发布作品 ID（升序）。
+func (s *Store) SitemapPoemIDs(shard int) ([]int64, error) {
+	lo, hi, err := s.idRange()
+	if err != nil {
+		return nil, err
+	}
+	if shard < 0 {
+		return nil, nil
+	}
+	start := lo + int64(shard)*sitemapChunkSize
+	if start > hi {
+		return nil, nil
+	}
+	end := start + sitemapChunkSize
+	rows, err := s.db.Query(`SELECT p.id FROM poems p WHERE `+publishedCond+
+		` AND p.id >= ? AND p.id < ? ORDER BY p.id LIMIT ?`, start, end, sitemapChunkSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, 256)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// SitemapPoetNames 返回诗人名单（按作品数降序，最多 sitemapChunkSize 位），
+// 结果缓存 24 小时：34 万行的 GROUP BY 不宜每个爬虫请求都跑一次。
+func (s *Store) SitemapPoetNames() ([]model.Poet, error) {
+	return s.poetNames.Get("all", func() ([]model.Poet, error) {
+		rows, err := s.db.Query(`SELECT p.author, p.dynasty, COUNT(*) AS cnt
+			FROM poems p WHERE `+publishedCond+`
+			GROUP BY p.author, p.dynasty
+			ORDER BY cnt DESC, p.author LIMIT ?`, sitemapChunkSize)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var list []model.Poet
+		for rows.Next() {
+			var p model.Poet
+			var cnt int
+			if err := rows.Scan(&p.Name, &p.Dynasty, &cnt); err != nil {
+				return nil, err
+			}
+			p.PoemCount = cnt
+			list = append(list, p)
+		}
+		return list, rows.Err()
+	})
 }
 
 // ErrNotFound 统一的「不存在」错误。

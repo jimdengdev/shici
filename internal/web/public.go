@@ -1,7 +1,10 @@
 package web
 
 import (
+	"encoding/json"
 	"fmt"
+	htmltemplate "html/template"
+	"log"
 	"net/url"
 	"strconv"
 	"strings"
@@ -21,8 +24,30 @@ func Register(app *iris.Application, st *store.Store) {
 	tmpl := view.HTML(Templates(), ".html").
 		Layout("layouts/layout.html")
 	app.RegisterView(tmpl)
+
+	// 基础安全响应头（Caddy 也有，直连应用端口时同样生效）
+	app.Use(func(ctx iris.Context) {
+		ctx.Header("X-Content-Type-Options", "nosniff")
+		ctx.Header("X-Frame-Options", "SAMEORIGIN")
+		ctx.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		ctx.Next()
+	})
+
 	// 静态资源：内容哈希 ETag + 一年 immutable 缓存（URL 带 ?v= 版本）
 	app.Get("/static/{file:path}", StaticHandler())
+
+	// 健康检查（HEAD 由 main 统一转成 GET）
+	app.Get("/healthz", func(ctx iris.Context) {
+		ctx.Header("Cache-Control", "no-store")
+		ctx.WriteString("ok")
+	})
+
+	// SEO：robots 与分片 sitemap
+	app.Get("/robots.txt", robots)
+	app.Get("/sitemap.xml", sitemapIndex(st))
+	app.Get("/sitemap-pages.xml", sitemapPages(st))
+	app.Get("/sitemap-poems/{file:string}", sitemapPoems(st))
+	app.Get("/sitemap-poets.xml", sitemapPoets(st))
 
 	// 页面（挂页面缓存中间件：命中直接回 HTML，后台写入/SIGUSR1 会清空）
 	pc := PageCache()
@@ -31,7 +56,7 @@ func Register(app *iris.Application, st *store.Store) {
 	app.Get("/poems/{id:int64}", pc, poemDetail(st))
 	app.Get("/poets", pc, listPoets(st))
 	app.Get("/poets/{name:string}", pc, poetDetail(st))
-	app.Get("/about", pc, about)
+	app.Get("/about", pc, about(st))
 	app.Get("/random", random(st)) // 每次随机跳转，不缓存
 
 	// JSON API：只开放三个——随机整首、随机一句、按诗名取全篇。
@@ -41,6 +66,15 @@ func Register(app *iris.Application, st *store.Store) {
 	app.Get("/api/random", rl, apiRandomPoem(st))
 	app.Get("/api/random/line", rl, apiRandomLine(st))
 	app.Get("/api/poem", rl, pc, apiPoemByTitle(st)) // /api/poem?title=静夜思[&author=李白]
+
+	// 未知路由：API 返回 JSON，页面返回站内 404
+	app.OnErrorCode(iris.StatusNotFound, func(ctx iris.Context) {
+		if strings.HasPrefix(ctx.Path(), "/api/") {
+			jsonErr(ctx, iris.StatusNotFound, "接口不存在")
+			return
+		}
+		notFound(ctx, st)
+	})
 }
 
 // render 公共渲染：默认布局 + 公共导航数据。
@@ -50,7 +84,45 @@ func render(ctx iris.Context, st *store.Store, name string, data iris.Map) {
 	}
 	data["Dynasties"] = st.Dynasties()
 	data["AssetVersion"] = AssetVersion()
+	data["SiteName"] = siteName
+	if _, ok := data["Description"]; !ok {
+		data["Description"] = siteDescription
+	}
+	if _, ok := data["Canonical"]; !ok {
+		data["Canonical"] = canonicalURL(ctx)
+	}
+	if _, ok := data["OGType"]; !ok {
+		data["OGType"] = "website"
+	}
 	ctx.View(name, data)
+}
+
+// serverError 记录错误并渲染 500 页面（避免数据库故障时静默显示空列表）。
+func serverError(ctx iris.Context, st *store.Store, err error) {
+	log.Printf("[web] %s %s: %v", ctx.Method(), ctx.Path(), err)
+	ctx.StatusCode(iris.StatusInternalServerError)
+	render(ctx, st, "500.html", iris.Map{"Title": "服务异常", "NoIndex": true})
+}
+
+// poemJSONLD 诗词详情页的结构化数据（schema.org CreativeWork）。
+func poemJSONLD(base string, m model.Poem) htmltemplate.JS {
+	ld := map[string]any{
+		"@context":    "https://schema.org",
+		"@type":       "CreativeWork",
+		"name":        m.Title,
+		"author":      map[string]any{"@type": "Person", "name": m.Author},
+		"inLanguage":  "zh-CN",
+		"text":        m.Content,
+		"genre":       m.Category,
+		"url":         fmt.Sprintf("%s/poems/%d", base, m.ID),
+		"description": m.Brief(120),
+	}
+	b, err := json.Marshal(ld) // encoding/json 会转义 < > &，可安全嵌入 <script>
+	if err != nil {
+		return ""
+	}
+	// 必须用 template.JS：html/template 会把 <script> 内的普通字符串按 JS 字符串转义。
+	return htmltemplate.JS(b)
 }
 
 // ── 页面处理器 ─────────────────────────────────────────
@@ -62,7 +134,10 @@ func home(st *store.Store) iris.Handler {
 			daily = model.Poem{}
 		}
 		featured := st.FeaturedPoems(8)
-		stats, _ := st.Stats()
+		stats, err := st.Stats()
+		if err != nil {
+			log.Printf("[web] 首页统计: %v", err)
+		}
 		render(ctx, st, "index.html", iris.Map{
 			"Title":    "首页",
 			"Daily":    daily,
@@ -75,19 +150,31 @@ func home(st *store.Store) iris.Handler {
 func listPoems(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
 		f := filterFrom(ctx)
-		list, total, _ := st.ListPoems(&f)
+		list, total, err := st.ListPoems(&f)
+		if err != nil {
+			serverError(ctx, st, err)
+			return
+		}
 		pages := store.PageCount(total, f.PageSize)
+		desc := fmt.Sprintf("诗词检索：共 %d 首古典诗词，支持关键词、诗人、朝代与体裁筛选。", total)
+		if f.Keyword != "" {
+			desc = fmt.Sprintf("“%s”相关诗词共 %d 首，支持按诗人、朝代与体裁继续筛选。", f.Keyword, total)
+		}
 		render(ctx, st, "poems.html", iris.Map{
-			"Title":    "诗词检索",
-			"Keyword":  f.Keyword,
-			"Poet":     f.Poet,
-			"Poems":    list,
-			"Total":    total,
-			"Page":     f.Page,
-			"Pages":    pages,
-			"Genres":   st.Genres(),
-			"Filter":   f,
-			"PageURLs": pageURLs(ctx, "/poems", f.Page, pages),
+			"Title":       "诗词检索",
+			"Description": desc,
+			// 筛选/分页页不参与收录，规范地址统一指向 /poems
+			"Canonical": siteBase(ctx) + "/poems",
+			"NoIndex":   f.Keyword != "" || f.Poet != "" || f.Dynasty != "" || f.Genre != "" || f.Tag != "" || f.Page > 1,
+			"Keyword":   f.Keyword,
+			"Poet":      f.Poet,
+			"Poems":     list,
+			"Total":     total,
+			"Page":      f.Page,
+			"Pages":     pages,
+			"Genres":    st.Genres(),
+			"Filter":    f,
+			"PageURLs":  pageURLs(ctx, "/poems", f.Page, pages),
 		})
 	}
 }
@@ -103,11 +190,14 @@ func poemDetail(st *store.Store) iris.Handler {
 		poet, _ := st.GetPoet(m.Author)
 		prev, next := st.PrevNext(m.ID)
 		render(ctx, st, "poem.html", iris.Map{
-			"Title": m.Title,
-			"Poem":  m,
-			"Poet":  poet,
-			"Prev":  prev,
-			"Next":  next,
+			"Title":       m.Title + " · " + m.Author,
+			"Description": fmt.Sprintf("《%s》%s（%s·%s）：%s", m.Title, m.Author, m.Dynasty, m.Category, m.Brief(80)),
+			"OGType":      "article",
+			"JSONLD":      poemJSONLD(siteBase(ctx), m),
+			"Poem":        m,
+			"Poet":        poet,
+			"Prev":        prev,
+			"Next":        next,
 		})
 	}
 }
@@ -116,7 +206,11 @@ func listPoets(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
 		keyword := ctx.URLParam("keyword")
 		dynasty := ctx.URLParam("dynasty")
-		poets, _ := st.ListPoets(keyword, dynasty)
+		poets, err := st.ListPoets(keyword, dynasty)
+		if err != nil {
+			serverError(ctx, st, err)
+			return
+		}
 		// 按朝代分组
 		groups := map[string][]model.Poet{}
 		var order []string
@@ -134,15 +228,22 @@ func listPoets(st *store.Store) iris.Handler {
 		if keyword != "" {
 			title = "诗人检索：“" + keyword + "”"
 		}
+		desc := fmt.Sprintf("诗人检索：共 %d 位诗人，按作品数排序，附朝代与小传。", len(poets))
+		if keyword != "" {
+			desc = fmt.Sprintf("“%s”相关诗人共 %d 位。", keyword, len(poets))
+		}
 		render(ctx, st, "poets.html", iris.Map{
-			"Title":    title,
-			"Keyword":  keyword,
-			"Dynasty":  dynasty,
-			"Groups":   groups,
-			"Order":    order,
-			"Poets":    poets,
-			"Total":    len(poets),
-			"PageURLs": nil,
+			"Title":       title,
+			"Description": desc,
+			"Canonical":   siteBase(ctx) + "/poets",
+			"NoIndex":     keyword != "" || dynasty != "",
+			"Keyword":     keyword,
+			"Dynasty":     dynasty,
+			"Groups":      groups,
+			"Order":       order,
+			"Poets":       poets,
+			"Total":       len(poets),
+			"PageURLs":    nil,
 		})
 	}
 }
@@ -155,11 +256,21 @@ func poetDetail(st *store.Store) iris.Handler {
 			notFound(ctx, st)
 			return
 		}
-		poems, _ := st.PoemsByPoet(p.Name)
+		poems, err := st.PoemsByPoet(p.Name)
+		if err != nil {
+			serverError(ctx, st, err)
+			return
+		}
+		desc := p.Intro
+		if desc == "" {
+			desc = fmt.Sprintf("%s（%s）的诗词作品，共收录 %d 首。", p.Name, p.Dynasty, p.PoemCount)
+		}
 		render(ctx, st, "poet.html", iris.Map{
-			"Title": p.Name,
-			"Poet":  p,
-			"Poems": poems,
+			"Title":       p.Name,
+			"Description": desc,
+			"Canonical":   siteBase(ctx) + p.URL(),
+			"Poet":        p,
+			"Poems":       poems,
 		})
 	}
 }
@@ -175,8 +286,13 @@ func random(st *store.Store) iris.Handler {
 	}
 }
 
-func about(ctx iris.Context) {
-	ctx.View("about.html", iris.Map{"Title": "关于本站"})
+func about(st *store.Store) iris.Handler {
+	return func(ctx iris.Context) {
+		render(ctx, st, "about.html", iris.Map{
+			"Title":       "关于本站",
+			"Description": "诗词雅集是公益中国诗词站点：全部文本属公有领域，免费开放检索与阅读。",
+		})
+	}
 }
 
 // ── JSON API ───────────────────────────────────────────
@@ -339,5 +455,5 @@ func clampRunes(s string, n int) string {
 
 func notFound(ctx iris.Context, st *store.Store) {
 	ctx.StatusCode(iris.StatusNotFound)
-	render(ctx, st, "404.html", iris.Map{"Title": "未找到"})
+	render(ctx, st, "404.html", iris.Map{"Title": "未找到", "NoIndex": true})
 }
