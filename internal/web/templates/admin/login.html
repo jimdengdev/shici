@@ -10,13 +10,14 @@
   <div class="login-card">
     <a class="logo" href="/"><span class="seal">雅</span>诗词雅集</a>
     <h2>后台管理</h2>
-    {{ if .Error }}<p class="form-error">账号或密码不正确</p>{{ end }}
+    {{ if .Error }}<p class="form-error">{{ .Error }}</p>{{ end }}
     <form action="/admin/login" method="post">
+      <input type="hidden" name="csrf" value="{{ .CSRF }}">
       <label>账号 <input type="text" name="username" required autofocus></label>
       <label>密码 <input type="password" name="password" required></label>
       <button type="submit" class="btn-primary">登 录</button>
     </form>
-    <p class="muted small">默认账号 admin / shici@2024，可用环境变量 ADMIN_USER / ADMIN_PASS 修改</p>
+    <p class="muted small">账号密码由环境变量 ADMIN_USER / ADMIN_PASS（或 ADMIN_HASH）配置</p>
   </div>
 </body>
 </html>

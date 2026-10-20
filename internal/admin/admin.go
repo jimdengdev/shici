@@ -3,11 +3,18 @@
 package admin
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
+	"log"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kataras/iris/v12"
@@ -21,22 +28,27 @@ import (
 // AdminPageSize 后台列表每页条数。
 const AdminPageSize = 20
 
-var sess = sessions.New(sessions.Config{
-	Cookie:  "shici_admin",
-	Expires: 12 * time.Hour,
-	// 反向代理 / 直接用 IP 访问时不要把 Cookie 的 Domain 固定为请求子域，
-	// 否则浏览器会因 Domain 与当前主机不一致而丢弃会话 Cookie。
-	DisableSubdomainPersistence: true,
-})
+// sess 在 Register 中初始化：需等 main 读取完 .env 后再读环境变量。
+var sess *sessions.Sessions
 
 // Register 注册后台路由（/admin/**）。
 func Register(app *iris.Application, st *store.Store) {
-	// 登录无需鉴权
-	app.Get("/admin/login", loginForm)
-	app.Post("/admin/login", loginSubmit(st))
+	sess = sessions.New(sessions.Config{
+		Cookie:  "shici_admin",
+		Expires: 12 * time.Hour,
+		// 反向代理 / 直接用 IP 访问时不要把 Cookie 的 Domain 固定为请求子域，
+		// 否则浏览器会因 Domain 与当前主机不一致而丢弃会话 Cookie。
+		DisableSubdomainPersistence: true,
+		// 部署在 HTTPS（Caddy）之后时设置 SHICI_COOKIE_SECURE=1，让 Cookie 带 Secure。
+		CookieSecureTLS: os.Getenv("SHICI_COOKIE_SECURE") == "1",
+	})
 
-	// 其余后台路由需登录
-	p := app.Party("/admin", requireAuth)
+	// 登录无需鉴权，但仍校验 CSRF
+	app.Get("/admin/login", loginForm)
+	app.Post("/admin/login", loginSubmit())
+
+	// 其余后台路由需登录 + POST 需 CSRF 令牌
+	p := app.Party("/admin", requireAuth, requireCSRF)
 	p.Get("/", dashboard(st))
 	p.Get("/logout", logout)
 
@@ -58,16 +70,143 @@ func Register(app *iris.Application, st *store.Store) {
 
 // ── 鉴权 ───────────────────────────────────────────────
 
+// genPassOnce 在未配置密码时生成一次性临时密码（不把默认密码写死在代码里）。
+var (
+	genPassOnce sync.Once
+	genPass     string
+)
+
 func credentials() (user, pass string) {
 	user = os.Getenv("ADMIN_USER")
 	pass = os.Getenv("ADMIN_PASS")
 	if user == "" {
 		user = "admin"
 	}
-	if pass == "" {
-		pass = "shici@2024"
+	if pass == "" && os.Getenv("ADMIN_HASH") == "" {
+		genPassOnce.Do(func() {
+			b := make([]byte, 12)
+			if _, err := rand.Read(b); err != nil {
+				log.Fatalf("生成后台临时密码失败: %v", err)
+			}
+			genPass = hex.EncodeToString(b)
+			log.Printf("[admin] 未配置 ADMIN_PASS / ADMIN_HASH，已生成临时密码：%s（仅本次进程有效，重启后重置）", genPass)
+		})
+		pass = genPass
 	}
 	return
+}
+
+// csrfToken 返回当前会话的 CSRF 令牌（没有则生成）。
+func csrfToken(ctx iris.Context) string {
+	s := sess.Start(ctx)
+	if t := s.GetString("csrf"); t != "" {
+		return t
+	}
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	t := hex.EncodeToString(b)
+	s.Set("csrf", t)
+	return t
+}
+
+// checkCSRF 常量时间比对表单里的 CSRF 令牌与会话中的令牌。
+func checkCSRF(ctx iris.Context) bool {
+	want := sess.Start(ctx).GetString("csrf")
+	got := ctx.FormValue("csrf")
+	if want == "" || got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1
+}
+
+// requireCSRF 对后台写操作校验 CSRF 令牌（GET 只读操作放行）。
+func requireCSRF(ctx iris.Context) {
+	switch ctx.Method() {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		if !checkCSRF(ctx) {
+			ctx.StatusCode(iris.StatusForbidden)
+			ctx.WriteString("CSRF 校验失败，请刷新页面后重试")
+			ctx.StopExecution()
+			return
+		}
+	}
+	ctx.Next()
+}
+
+// view 统一渲染后台页面：自动注入 CSRF 令牌供表单使用。
+func view(ctx iris.Context, name string, data iris.Map) {
+	if data == nil {
+		data = iris.Map{}
+	}
+	data["CSRF"] = csrfToken(ctx)
+	ctx.View(name, data)
+}
+
+// ── 登录限流 ───────────────────────────────────────────
+
+const (
+	loginMaxFails = 10
+	loginWindow   = 10 * time.Minute
+)
+
+type failEntry struct {
+	n     int
+	reset time.Time
+}
+
+var loginFailures = struct {
+	sync.Mutex
+	m map[string]*failEntry
+}{m: make(map[string]*failEntry)}
+
+func clientIP(ctx iris.Context) string {
+	host, _, err := net.SplitHostPort(ctx.RemoteAddr())
+	if err != nil {
+		return ctx.RemoteAddr()
+	}
+	return host
+}
+
+func loginBlocked(ip string) bool {
+	loginFailures.Lock()
+	defer loginFailures.Unlock()
+	e, ok := loginFailures.m[ip]
+	if !ok {
+		return false
+	}
+	if time.Now().After(e.reset) {
+		delete(loginFailures.m, ip)
+		return false
+	}
+	return e.n >= loginMaxFails
+}
+
+func loginFail(ip string) {
+	loginFailures.Lock()
+	defer loginFailures.Unlock()
+	e, ok := loginFailures.m[ip]
+	if !ok || time.Now().After(e.reset) {
+		e = &failEntry{reset: time.Now().Add(loginWindow)}
+		loginFailures.m[ip] = e
+	}
+	e.n++
+	// 简单的过期清理，避免 IP 表无限增长
+	if len(loginFailures.m) > 5000 {
+		now := time.Now()
+		for k, v := range loginFailures.m {
+			if now.After(v.reset) {
+				delete(loginFailures.m, k)
+			}
+		}
+	}
+}
+
+func loginSucceeded(ip string) {
+	loginFailures.Lock()
+	delete(loginFailures.m, ip)
+	loginFailures.Unlock()
 }
 
 func requireAuth(ctx iris.Context) {
@@ -78,32 +217,53 @@ func requireAuth(ctx iris.Context) {
 	ctx.Next()
 }
 
-func loginForm(ctx iris.Context) {
+func loginPage(ctx iris.Context, status int, msg string) {
+	ctx.StatusCode(status)
 	ctx.ViewLayout(iris.NoLayout)
-	ctx.View("admin/login.html", iris.Map{
-		"Title": "登录", "Error": ctx.URLParam("e") == "1",
-	})
+	view(ctx, "admin/login.html", iris.Map{"Title": "登录", "Error": msg})
 }
 
-func loginSubmit(st *store.Store) iris.Handler {
+func loginForm(ctx iris.Context) {
+	msg := ""
+	switch ctx.URLParam("e") {
+	case "1":
+		msg = "账号或密码不正确"
+	case "2":
+		msg = "尝试过于频繁，请稍后再试"
+	}
+	loginPage(ctx, iris.StatusOK, msg)
+}
+
+func loginSubmit() iris.Handler {
 	return func(ctx iris.Context) {
+		ip := clientIP(ctx)
+		if loginBlocked(ip) {
+			loginPage(ctx, iris.StatusTooManyRequests, "尝试过于频繁，请稍后再试")
+			return
+		}
+		if !checkCSRF(ctx) {
+			loginPage(ctx, iris.StatusForbidden, "页面已过期，请刷新后重试")
+			return
+		}
+
 		user, pass := credentials()
-		if ctx.FormValue("username") != user {
-			ctx.Redirect("/admin/login?e=1")
+		// 用户名与密码都用常量时间比较，避免通过响应时间探测
+		userOK := subtle.ConstantTimeCompare([]byte(ctx.FormValue("username")), []byte(user)) == 1
+		var passOK bool
+		if hash := os.Getenv("ADMIN_HASH"); hash != "" {
+			passOK = bcrypt.CompareHashAndPassword([]byte(hash), []byte(ctx.FormValue("password"))) == nil
+		} else {
+			passOK = subtle.ConstantTimeCompare([]byte(ctx.FormValue("password")), []byte(pass)) == 1
+		}
+		if !userOK || !passOK {
+			loginFail(ip)
+			loginPage(ctx, iris.StatusOK, "账号或密码不正确")
 			return
 		}
-		// 默认密码为明文比对；若设置了 ADMIN_HASH（bcrypt），则用哈希校验
-		hash := os.Getenv("ADMIN_HASH")
-		if hash != "" {
-			if bcrypt.CompareHashAndPassword([]byte(hash), []byte(ctx.FormValue("password"))) != nil {
-				ctx.Redirect("/admin/login?e=1")
-				return
-			}
-		} else if ctx.FormValue("password") != pass {
-			ctx.Redirect("/admin/login?e=1")
-			return
-		}
+
+		loginSucceeded(ip)
 		s := sess.Start(ctx)
+		s.Delete("csrf") // 登录成功后轮换令牌，防会话固定
 		s.Set("user", user)
 		ctx.Redirect("/admin")
 	}
@@ -123,7 +283,7 @@ func dashboard(st *store.Store) iris.Handler {
 		if err != nil {
 			stats = store.Stats{}
 		}
-		ctx.View("admin/dashboard.html", iris.Map{
+		view(ctx, "admin/dashboard.html", iris.Map{
 			"Title": "仪表盘", "Stats": stats,
 		})
 	}
@@ -137,16 +297,16 @@ func poemList(st *store.Store) iris.Handler {
 		f := store.Filter{
 			Keyword: ctx.URLParam("keyword"), Poet: ctx.URLParam("poet"),
 			Dynasty: ctx.URLParam("dynasty"), Genre: ctx.URLParam("genre"),
-			Page: page, PageSize: AdminPageSize,
+			Page: page, PageSize: AdminPageSize, AllStatus: true,
 		}
-		list, total, _ := st.ListPoems(f)
-		ctx.View("admin/poems.html", iris.Map{
+		list, total, _ := st.ListPoems(&f)
+		pages := store.PageCount(total, AdminPageSize)
+		view(ctx, "admin/poems.html", iris.Map{
 			"Title": "诗词管理", "Poems": list, "Total": total,
-			"Filter": f, "Page": page,
-			"Pages":  (total + AdminPageSize - 1) / AdminPageSize,
-			"Genres": st.Genres(),
-			"PageURLs": adminPageURLs(ctx, "/admin/poems", page,
-				(total+AdminPageSize-1)/AdminPageSize),
+			"Filter": f, "Page": f.Page,
+			"Pages":    pages,
+			"Genres":   st.Genres(),
+			"PageURLs": adminPageURLs(ctx, "/admin/poems", f.Page, pages),
 		})
 	}
 }
@@ -165,7 +325,7 @@ func poemFormData(st *store.Store, m model.Poem, action string, errMsg string) i
 
 func poemFormNew(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
-		ctx.View("admin/poem_form.html",
+		view(ctx, "admin/poem_form.html",
 			poemFormData(st, model.Poem{Category: "古诗", Status: "published"}, "/admin/poems/new", ""))
 	}
 }
@@ -194,11 +354,11 @@ func poemCreate(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
 		m := poemFromForm(ctx)
 		if !poemValid(m) {
-			ctx.View("admin/poem_form.html", poemFormData(st, m, "/admin/poems/new", "请填写标题、诗人与正文"))
+			view(ctx, "admin/poem_form.html", poemFormData(st, m, "/admin/poems/new", "请填写标题、诗人与正文"))
 			return
 		}
 		if _, err := st.CreatePoem(m); err != nil {
-			ctx.View("admin/poem_form.html", poemFormData(st, m, "/admin/poems/new", "保存失败："+err.Error()))
+			view(ctx, "admin/poem_form.html", poemFormData(st, m, "/admin/poems/new", "保存失败："+err.Error()))
 			return
 		}
 		ctx.Redirect("/admin/poems")
@@ -208,12 +368,12 @@ func poemCreate(st *store.Store) iris.Handler {
 func poemFormEdit(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
 		id := ctx.Params().GetInt64Default("id", 0)
-		m, err := st.GetPoem(id)
+		m, err := st.GetPoemForAdmin(id)
 		if err != nil {
 			ctx.Redirect("/admin/poems")
 			return
 		}
-		ctx.View("admin/poem_form.html",
+		view(ctx, "admin/poem_form.html",
 			poemFormData(st, m, fmt.Sprintf("/admin/poems/%d/edit", id), ""))
 	}
 }
@@ -224,12 +384,12 @@ func poemUpdate(st *store.Store) iris.Handler {
 		m := poemFromForm(ctx)
 		m.ID = id
 		if !poemValid(m) {
-			ctx.View("admin/poem_form.html",
+			view(ctx, "admin/poem_form.html",
 				poemFormData(st, m, fmt.Sprintf("/admin/poems/%d/edit", id), "请填写标题、诗人与正文"))
 			return
 		}
 		if err := st.UpdatePoem(m); err != nil {
-			ctx.View("admin/poem_form.html",
+			view(ctx, "admin/poem_form.html",
 				poemFormData(st, m, fmt.Sprintf("/admin/poems/%d/edit", id), "保存失败："+err.Error()))
 			return
 		}
@@ -251,7 +411,7 @@ func poemDelete(st *store.Store) iris.Handler {
 func poetList(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
 		poets, _ := st.ListPoets(ctx.URLParam("keyword"), "")
-		ctx.View("admin/poets.html", iris.Map{
+		view(ctx, "admin/poets.html", iris.Map{
 			"Title": "诗人管理", "Poets": poets, "Total": len(poets),
 			"Keyword": ctx.URLParam("keyword"),
 		})
@@ -277,7 +437,7 @@ func poetFormEdit(st *store.Store) iris.Handler {
 			ctx.Redirect("/admin/poets")
 			return
 		}
-		ctx.View("admin/poet_form.html", poetFormData(p, p.EditURL(), ""))
+		view(ctx, "admin/poet_form.html", poetFormData(p, p.EditURL(), ""))
 	}
 }
 
@@ -288,12 +448,12 @@ func poetUpdate(st *store.Store) iris.Handler {
 		dynasty := strings.TrimSpace(ctx.FormValue("dynasty"))
 		if name == "" {
 			cur, _ := st.GetPoet(oldName)
-			ctx.View("admin/poet_form.html", poetFormData(cur, cur.EditURL(), "请填写诗人姓名"))
+			view(ctx, "admin/poet_form.html", poetFormData(cur, cur.EditURL(), "请填写诗人姓名"))
 			return
 		}
 		if err := st.RenamePoet(oldName, name, dynasty); err != nil {
 			cur, _ := st.GetPoet(oldName)
-			ctx.View("admin/poet_form.html", poetFormData(cur, cur.EditURL(), "保存失败："+err.Error()))
+			view(ctx, "admin/poet_form.html", poetFormData(cur, cur.EditURL(), "保存失败："+err.Error()))
 			return
 		}
 		ctx.Redirect("/admin/poets")

@@ -24,6 +24,7 @@
       <td class="row-actions">
         <a href="{{ .EditURL }}">编辑</a>
         <form action="{{ .DeleteURL }}" method="post" onsubmit="return confirm('确认删除诗人「{{ .Name }}」？其名下 {{ .PoemCount }} 首作品将一并置为归档状态（数据保留）。')">
+          <input type="hidden" name="csrf" value="{{ $.CSRF }}">
           <button type="submit" class="danger">删除</button>
         </form>
       </td>

@@ -62,8 +62,6 @@ func PageCache() iris.Handler {
 		orig := ctx.ResponseWriter()
 		tee := &teeWriter{ResponseWriter: orig}
 		ctx.ResetResponseWriter(tee)
-		orig.Header().Set("X-Cache", "MISS")
-		orig.Header().Set("Cache-Control", "public, max-age=60")
 		ctx.Next()
 		ctx.ResetResponseWriter(orig)
 
@@ -77,20 +75,35 @@ func PageCache() iris.Handler {
 }
 
 // teeWriter 包装原始 ResponseWriter：正常写回客户端的同时捕获 200 响应体。
+// 缓存头也在首次写响应时设置：只有 200 才声明可缓存，4xx/5xx 一律 no-store，
+// 避免 404 等错误页被浏览器或中间层缓存。
 type teeWriter struct {
 	context.ResponseWriter
-	buf  bytes.Buffer
-	code int
+	buf         bytes.Buffer
+	code        int
+	wroteHeader bool
 }
 
 func (w *teeWriter) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
 	w.code = code
+	h := w.ResponseWriter.Header()
+	if code == http.StatusOK {
+		h.Set("X-Cache", "MISS")
+		h.Set("Cache-Control", "public, max-age=60")
+	} else {
+		h.Del("X-Cache")
+		h.Set("Cache-Control", "no-store")
+	}
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *teeWriter) Write(p []byte) (int, error) {
-	if w.code == 0 {
-		w.code = http.StatusOK
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
 	}
 	n, err := w.ResponseWriter.Write(p)
 	if w.code == http.StatusOK {

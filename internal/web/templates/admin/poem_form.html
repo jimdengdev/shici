@@ -6,6 +6,7 @@
 {{ if .Error }}<p class="form-error">{{ .Error }}</p>{{ end }}
 
 <form class="admin-form" action="{{ .Action }}" method="post">
+  <input type="hidden" name="csrf" value="{{ .CSRF }}">
   {{ if .Poem.ID }}<input type="hidden" name="id" value="{{ .Poem.ID }}">{{ end }}
   <label>标题 <input type="text" name="title" value="{{ .Poem.Title }}" maxlength="100" required></label>
   <div class="form-row">

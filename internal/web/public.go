@@ -73,7 +73,8 @@ func home(st *store.Store) iris.Handler {
 func listPoems(st *store.Store) iris.Handler {
 	return func(ctx iris.Context) {
 		f := filterFrom(ctx)
-		list, total, _ := st.ListPoems(f)
+		list, total, _ := st.ListPoems(&f)
+		pages := store.PageCount(total, f.PageSize)
 		render(ctx, st, "poems.html", iris.Map{
 			"Title":    "诗词检索",
 			"Keyword":  f.Keyword,
@@ -81,10 +82,10 @@ func listPoems(st *store.Store) iris.Handler {
 			"Poems":    list,
 			"Total":    total,
 			"Page":     f.Page,
-			"Pages":    (total + f.PageSize - 1) / f.PageSize,
+			"Pages":    pages,
 			"Genres":   st.Genres(),
 			"Filter":   f,
-			"PageURLs": pageURLs(ctx, "/poems", f.Page, (total+f.PageSize-1)/f.PageSize),
+			"PageURLs": pageURLs(ctx, "/poems", f.Page, pages),
 		})
 	}
 }
@@ -134,6 +135,7 @@ func listPoets(st *store.Store) iris.Handler {
 		render(ctx, st, "poets.html", iris.Map{
 			"Title":    title,
 			"Keyword":  keyword,
+			"Dynasty":  dynasty,
 			"Groups":   groups,
 			"Order":    order,
 			"Poets":    poets,

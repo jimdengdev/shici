@@ -32,6 +32,7 @@
       <td class="row-actions">
         <a href="/admin/poems/{{ .ID }}/edit">编辑</a>
         <form action="/admin/poems/{{ .ID }}/delete" method="post" onsubmit="return confirm('确认删除《{{ .Title }}》？将置为归档状态，数据保留且不再展示。')">
+          <input type="hidden" name="csrf" value="{{ $.CSRF }}">
           <button type="submit" class="danger">删除</button>
         </form>
       </td>

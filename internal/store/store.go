@@ -162,6 +162,8 @@ type Filter struct {
 	Tag      string
 	Page     int
 	PageSize int
+	// AllStatus 为 true 时包含草稿（后台列表用），仍排除 archived。
+	AllStatus bool
 }
 
 // Store 数据存储。
@@ -635,22 +637,27 @@ func (s *Store) clauses(f *Filter) (where string, args []any, order string, orde
 		conds = append(conds, `CAST(p.tags AS CHAR) LIKE ?`)
 		args = append(args, like(v))
 	}
-	conds = append(conds, publishedCond)
+	statusCond := publishedCond
+	if f.AllStatus {
+		statusCond = `p.status <> 'archived'`
+	}
+	conds = append(conds, statusCond)
 	if order == "" {
 		order = "p.id"
 	}
 	return " WHERE " + strings.Join(conds, " AND "), args, order, rankArgs
 }
 
-// ListPoems 按条件检索（含总数）。分页参数被钳制在安全范围。
-func (s *Store) ListPoems(f Filter) ([]model.Poem, int, error) {
+// ListPoems 按条件检索（含总数）。分页参数被钳制在安全范围：
+// 页码超过总页数时回落到最后一页（f.Page 会被就地修正，便于调用方展示）。
+func (s *Store) ListPoems(f *Filter) ([]model.Poem, int, error) {
 	if f.Page < 1 {
 		f.Page = 1
 	}
 	if f.PageSize < 1 || f.PageSize > 100 {
 		f.PageSize = 20
 	}
-	where, args, order, orderArgs := s.clauses(&f)
+	where, args, order, orderArgs := s.clauses(f)
 
 	total, err := s.countCache.Get(countKey(where, args), func() (int, error) {
 		var n int
@@ -661,6 +668,10 @@ func (s *Store) ListPoems(f Filter) ([]model.Poem, int, error) {
 	})
 	if err != nil {
 		return nil, 0, err
+	}
+
+	if pages := PageCount(total, f.PageSize); f.Page > pages {
+		f.Page = pages // 深分页/越界页回落到最后一页，避免无意义的超大 OFFSET
 	}
 
 	q := `SELECT ` + poemCols + ` FROM poems p` + where + ` ORDER BY ` + order + ` LIMIT ? OFFSET ?`
@@ -724,15 +735,32 @@ func (s *Store) recentPoems(limit int) []model.Poem {
 	return list
 }
 
-// GetPoem 按 ID 取一首（status=archived 视为已删除，不再对外可见；草稿仍可读以便后台编辑）。
+// GetPoem 按 ID 取一首「已发布」作品（前台唯一入口，草稿与归档均不可见）。
 func (s *Store) GetPoem(id int64) (model.Poem, error) {
-	q := `SELECT ` + poemCols + ` FROM poems p WHERE p.id = ? AND p.status <> 'archived'`
+	return s.getPoem(id, publishedCond)
+}
+
+// GetPoemForAdmin 后台编辑：草稿与已发布可读，软删除（archived）不可读。
+func (s *Store) GetPoemForAdmin(id int64) (model.Poem, error) {
+	return s.getPoem(id, `p.status <> 'archived'`)
+}
+
+func (s *Store) getPoem(id int64, cond string) (model.Poem, error) {
+	q := `SELECT ` + poemCols + ` FROM poems p WHERE p.id = ? AND ` + cond
 	row := s.db.QueryRow(q, id)
 	m, err := scanPoem(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Poem{}, ErrNotFound
 	}
 	return m, err
+}
+
+// PageCount 由总数与每页条数计算页数（至少 1 页，避免「第 1 / 0 页」）。
+func PageCount(total, pageSize int) int {
+	if pageSize < 1 || total <= 0 {
+		return 1
+	}
+	return (total + pageSize - 1) / pageSize
 }
 
 // PrevNext 相邻两首（按 id 顺序）。
@@ -1239,7 +1267,8 @@ func (s *Store) Warmup() {
 	s.Dynasties()
 	s.Genres()
 	_, _ = s.ListPoets("", "")
-	_, 	_, _ = s.ListPoems(Filter{Page: 1, PageSize: 12})
+	f := Filter{Page: 1, PageSize: 12}
+	_, _, _ = s.ListPoems(&f)
 	_, _ = s.RandomPoem() // 预热随机池：填充后前 64 次随机请求零回源
 	_, _ = s.RandomLine()
 	log.Printf("[cache] 启动预热完成")

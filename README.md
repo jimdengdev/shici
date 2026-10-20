@@ -50,7 +50,7 @@ ADMIN_PASS=你的后台密码
 - **诗人没有独立表**：`/poets` 由 `poems.author + dynasty` 聚合派生（按作品数排序，最多 300 位），诗人小传取自内置的 51 位名家小传；后台「诗人管理」的编辑即批量改写其作品的作者/朝代
 - 首次连接自动建表（`IF NOT EXISTS`，不会影响已有数据）；库为空时灌入内置种子数据
 - 已兼容远端表上的唯一键 `uk_poems_dedup(dynasty,title,author)`：重复作品保存会报错
-- 环境变量：`PORT`、`SHICI_HOST`（监听地址，置于反向代理后设为 `127.0.0.1`）、`SHICI_DB`（SQLite 路径）、`SHICI_MYSQL_DSN` / `SHICI_MYSQL_DB`（二选一）、`ADMIN_USER` / `ADMIN_PASS` / `ADMIN_HASH`
+- 环境变量：`PORT`、`SHICI_HOST`（监听地址，置于反向代理后设为 `127.0.0.1`）、`SHICI_COOKIE_SECURE`（HTTPS 部署设为 `1`，会话 Cookie 带 `Secure`）、`SHICI_DB`（SQLite 路径）、`SHICI_MYSQL_DSN` / `SHICI_MYSQL_DB`（二选一）、`ADMIN_USER` / `ADMIN_PASS` / `ADMIN_HASH`
 - 配置来源：优先环境变量，未设置时自动加载同目录 `.env`（`SHICI_ENV_FILE` 可指定其他路径）
 - 数据库权限：`poems` 表已存在时不再执行任何 DDL，**只读账号（仅 SELECT）即可运行前台**；后台维护需要 `INSERT/UPDATE`，若账号只读，启动日志会打印提示，后台保存返回数据库的权限错误
 - **删除即改状态**：后台「删除」不做物理 `DELETE`，而是把 `status` 置为 `archived`；站点只展示 `published`，`archived` 记录保留在库中但不再出现在列表、详情、检索与统计里（需要时可把 `status` 改回 `published` 恢复）
@@ -91,7 +91,8 @@ curl 'http://localhost:8080/api/poem?title=%E9%9D%99%E5%A4%9C%E6%80%9D'
 
 ## 后台管理
 
-- 入口 `/admin`，默认账号 `admin` / `shici@2024`（**上线前务必用 `ADMIN_USER` / `ADMIN_PASS` 环境变量修改**，或设 `ADMIN_HASH` 为 bcrypt 哈希）
+- 入口 `/admin`，账号密码必须用 `ADMIN_USER` / `ADMIN_PASS` 环境变量配置（或设 `ADMIN_HASH` 为 bcrypt 哈希）；**未配置密码时启动会生成一次性随机临时密码并打印到日志**，不再使用内置默认密码
+- 登录失败限流：同一 IP 10 分钟内最多 10 次失败，超限返回 429；后台所有写操作校验 CSRF 令牌
 - session 登录（Iris sessions，12 小时有效期）
 - 仪表盘：收录统计、最近收录、按朝代分布
 - 诗词管理 / 诗人管理：筛选、分页、新增、编辑、删除（删诗人会级联删其作品）
