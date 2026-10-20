@@ -96,11 +96,11 @@ CREATE TABLE IF NOT EXISTS poems (
   KEY idx_poems_status (status),
   KEY idx_poems_featured (featured, created_at),
   KEY idx_poems_author (author),
-  KEY idx_poems_status_id (status, id),
+  -- InnoDB 二级索引会隐式附加主键，idx_poems_status / idx_poems_author
+  -- 已能覆盖 (status, id) / (author, id)，无需再建同前缀复合索引。
   KEY idx_poems_status_dynasty_id (status, dynasty, id),
   KEY idx_poems_status_category_id (status, category, id),
   KEY idx_poems_status_featured_id (status, featured, id),
-  KEY idx_poems_author_id (author, id),
   KEY idx_poems_status_author_dynasty (status, author, dynasty)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='古诗词表'
 `
@@ -108,11 +108,9 @@ CREATE TABLE IF NOT EXISTS poems (
 // mysqlIndexes 站点查询依赖的复合索引：新库由 DDL 直接建好，
 // 已存在的库（多为历史库）启动时按需补建，避免列表页 ORDER BY 触发全表 filesort。
 var mysqlIndexes = []struct{ name, spec string }{
-	{"idx_poems_status_id", "(status, id)"},
 	{"idx_poems_status_dynasty_id", "(status, dynasty, id)"},
 	{"idx_poems_status_category_id", "(status, category, id)"},
 	{"idx_poems_status_featured_id", "(status, featured, id)"},
-	{"idx_poems_author_id", "(author, id)"},
 	{"idx_poems_status_author_dynasty", "(status, author, dynasty)"},
 }
 
@@ -528,6 +526,13 @@ const poemCols = `p.id, p.title, p.author, p.dynasty, p.category, p.content,
 	p.translation, p.annotation, p.appreciation, p.tags, p.featured,
 	p.view_count, p.favorite_count, p.comment_count, p.status`
 
+// poemListCols 列表页专用：正文只取前 200 字（够生成摘要），译文/注释/赏析不回传。
+// 34 万行库上可显著减少 TEXT 字段的 IO 与网络传输。
+const poemListCols = `p.id, p.title, p.author, p.dynasty, p.category,
+	SUBSTR(p.content, 1, 200) AS content,
+	'' AS translation, '' AS annotation, '' AS appreciation, p.tags, p.featured,
+	p.view_count, p.favorite_count, p.comment_count, p.status`
+
 func scanPoem(row interface{ Scan(...any) error }) (model.Poem, error) {
 	var m model.Poem
 	var tags sql.NullString
@@ -577,7 +582,14 @@ func tagsToJSON(tags string) any {
 	return string(b)
 }
 
-func like(v string) string { return "%" + v + "%" }
+// like 生成含通配符的匹配模式，并转义用户输入里的 % _ !，
+// 避免 `%` 这类输入退化成全表匹配。所有 LIKE 子句需带 ESCAPE '!'。
+func like(v string) string {
+	r := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_")
+	return "%" + r.Replace(v) + "%"
+}
+
+const likeEscape = ` ESCAPE '!'`
 
 // booleanQuery 清理 BOOLEAN MODE 保留字符（+ - > < ( ) ~ * " @），避免语法错误。
 func booleanQuery(q string) string {
@@ -617,12 +629,12 @@ func (s *Store) clauses(f *Filter) (where string, args []any, order string, orde
 			rankArgs = append(rankArgs, bq)
 		} else {
 			// 单字关键词 / 无全文索引（SQLite、未建索引的库）：回退 LIKE
-			conds = append(conds, `(p.title LIKE ? OR p.author LIKE ? OR p.content LIKE ? OR CAST(p.tags AS CHAR) LIKE ?)`)
+			conds = append(conds, `(p.title LIKE ?`+likeEscape+` OR p.author LIKE ?`+likeEscape+` OR p.content LIKE ?`+likeEscape+` OR CAST(p.tags AS CHAR) LIKE ?`+likeEscape+`)`)
 			args = append(args, like(q), like(q), like(q), like(q))
 		}
 	}
 	if v := strings.TrimSpace(f.Poet); v != "" {
-		conds = append(conds, `p.author LIKE ?`)
+		conds = append(conds, `p.author LIKE ?`+likeEscape)
 		args = append(args, like(v))
 	}
 	if v := strings.TrimSpace(f.Dynasty); v != "" {
@@ -634,7 +646,7 @@ func (s *Store) clauses(f *Filter) (where string, args []any, order string, orde
 		args = append(args, v)
 	}
 	if v := strings.TrimSpace(f.Tag); v != "" {
-		conds = append(conds, `CAST(p.tags AS CHAR) LIKE ?`)
+		conds = append(conds, `CAST(p.tags AS CHAR) LIKE ?`+likeEscape)
 		args = append(args, like(v))
 	}
 	statusCond := publishedCond
@@ -674,7 +686,7 @@ func (s *Store) ListPoems(f *Filter) ([]model.Poem, int, error) {
 		f.Page = pages // 深分页/越界页回落到最后一页，避免无意义的超大 OFFSET
 	}
 
-	q := `SELECT ` + poemCols + ` FROM poems p` + where + ` ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+	q := `SELECT ` + poemListCols + ` FROM poems p` + where + ` ORDER BY ` + order + ` LIMIT ? OFFSET ?`
 	queryArgs := append(append([]any{}, args...), orderArgs...)
 	queryArgs = append(queryArgs, f.PageSize, (f.Page-1)*f.PageSize)
 	rows, err := s.db.Query(q, queryArgs...)
@@ -861,7 +873,7 @@ func (s *Store) queryPoemByTitle(title, author string) (model.Poem, error) {
 	}
 	m, err := query(`p.title = ?`, title)
 	if errors.Is(err, ErrNotFound) {
-		return query(`p.title LIKE ?`, like(title)) // 包含匹配兜底
+		return query(`p.title LIKE ?`+likeEscape, like(title)) // 包含匹配兜底
 	}
 	return m, err
 }
@@ -1036,7 +1048,7 @@ func (s *Store) ListPoets(keyword, dynasty string) ([]model.Poet, error) {
 		var conds []string
 		var args []any
 		if q := strings.TrimSpace(keyword); q != "" {
-			conds = append(conds, `p.author LIKE ?`)
+			conds = append(conds, `p.author LIKE ?`+likeEscape)
 			args = append(args, like(q))
 		}
 		if v := strings.TrimSpace(dynasty); v != "" {
@@ -1097,7 +1109,7 @@ const PoetPoemLimit = 200
 
 // PoemsByPoet 某诗人的作品（按主键顺序，最多 PoetPoemLimit 首）。
 func (s *Store) PoemsByPoet(name string) ([]model.Poem, error) {
-	rows, err := s.db.Query(`SELECT `+poemCols+` FROM poems p WHERE p.author = ? AND `+
+	rows, err := s.db.Query(`SELECT `+poemListCols+` FROM poems p WHERE p.author = ? AND `+
 		publishedCond+` ORDER BY p.id LIMIT ?`, name, PoetPoemLimit)
 	if err != nil {
 		return nil, err

@@ -21,12 +21,13 @@ func Register(app *iris.Application, st *store.Store) {
 	tmpl := view.HTML(Templates(), ".html").
 		Layout("layouts/layout.html")
 	app.RegisterView(tmpl)
-	app.HandleDir("/static", Static())
+	// 静态资源：内容哈希 ETag + 一年 immutable 缓存（URL 带 ?v= 版本）
+	app.Get("/static/{file:path}", StaticHandler())
 
 	// 页面（挂页面缓存中间件：命中直接回 HTML，后台写入/SIGUSR1 会清空）
 	pc := PageCache()
 	app.Get("/", pc, home(st))
-	app.Get("/poems", pc, listPoems(st))
+	app.Get("/poems", pc, SearchLimit(), listPoems(st))
 	app.Get("/poems/{id:int64}", pc, poemDetail(st))
 	app.Get("/poets", pc, listPoets(st))
 	app.Get("/poets/{name:string}", pc, poetDetail(st))
@@ -48,6 +49,7 @@ func render(ctx iris.Context, st *store.Store, name string, data iris.Map) {
 		data = iris.Map{}
 	}
 	data["Dynasties"] = st.Dynasties()
+	data["AssetVersion"] = AssetVersion()
 	ctx.View(name, data)
 }
 
@@ -252,7 +254,11 @@ func apiPoemByTitle(st *store.Store) iris.Handler {
 			jsonErr(ctx, iris.StatusBadRequest, "缺少参数 title")
 			return
 		}
-		m, err := st.GetPoemByTitle(title, ctx.URLParam("author"))
+		if len([]rune(title)) > 100 {
+			jsonErr(ctx, iris.StatusBadRequest, "title 过长")
+			return
+		}
+		m, err := st.GetPoemByTitle(title, clampRunes(ctx.URLParam("author"), 60))
 		if err != nil {
 			jsonErr(ctx, iris.StatusNotFound, "诗词不存在")
 			return
@@ -272,12 +278,13 @@ func filterFrom(ctx iris.Context) store.Filter {
 	if genre == "" {
 		genre = ctx.URLParam("category")
 	}
+	// 输入长度钳制：避免超长关键词构造昂贵的全文/LIKE 查询与大量缓存键。
 	return store.Filter{
-		Keyword:  ctx.URLParam("keyword"),
-		Poet:     ctx.URLParam("poet"),
-		Dynasty:  ctx.URLParam("dynasty"),
-		Genre:    genre,
-		Tag:      ctx.URLParam("tag"),
+		Keyword:  clampRunes(ctx.URLParam("keyword"), 64),
+		Poet:     clampRunes(ctx.URLParam("poet"), 60),
+		Dynasty:  clampRunes(ctx.URLParam("dynasty"), 24),
+		Genre:    clampRunes(genre, 24),
+		Tag:      clampRunes(ctx.URLParam("tag"), 32),
 		Page:     page,
 		PageSize: PageSize,
 	}
@@ -319,6 +326,15 @@ func pageURLs(ctx iris.Context, base string, page, pages int) iris.Map {
 		"First": build(1), "Last": build(pages),
 		"Pages": pages, "Page": page,
 	}
+}
+
+// clampRunes 去空白并按字符数截断，防止超长查询参数。
+func clampRunes(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
 }
 
 func notFound(ctx iris.Context, st *store.Store) {

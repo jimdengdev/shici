@@ -3,6 +3,8 @@ package web
 import (
 	"bytes"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/kataras/iris/v12"
@@ -42,7 +44,7 @@ func PageCache() iris.Handler {
 			ctx.Next()
 			return
 		}
-		key := ctx.Request().RequestURI
+		key := pageCacheKey(ctx.Request())
 
 		if page, ok := cache.Peek(key); ok {
 			w := ctx.ResponseWriter()
@@ -72,6 +74,32 @@ func PageCache() iris.Handler {
 			})
 		}
 	}
+}
+
+// cacheJunkParams 与内容无关的跟踪参数：不影响渲染结果，不应产生独立缓存条目。
+var cacheJunkParams = map[string]bool{
+	"_": true, "t": true, "fbclid": true, "gclid": true, "spm": true, "ref": true,
+}
+
+// pageCacheKey 规范化缓存键：排序查询参数、丢弃空值与跟踪参数，
+// 避免同一页面因参数顺序或 utm_* 产生大量重复条目（缓存污染）。
+func pageCacheKey(r *http.Request) string {
+	u, err := url.ParseRequestURI(r.RequestURI)
+	if err != nil {
+		return r.RequestURI
+	}
+	q := u.Query()
+	for k, vs := range q {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, "utm_") || cacheJunkParams[lk] ||
+			len(vs) == 0 || (len(vs) == 1 && vs[0] == "") {
+			delete(q, k)
+		}
+	}
+	if len(q) == 0 {
+		return u.Path
+	}
+	return u.Path + "?" + q.Encode()
 }
 
 // teeWriter 包装原始 ResponseWriter：正常写回客户端的同时捕获 200 响应体。

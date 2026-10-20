@@ -49,6 +49,29 @@ func (b *tokenBucket) allow() bool {
 	return true
 }
 
+// 检索页限流：页面缓存之外的「新查询」合计 30 QPS（突发 60）。
+// 每个新关键词都会触发一次 COUNT(*) + 全文检索，限流可挡住构造 URL 的刷接口行为；
+// 缓存命中的请求在中间件之前就返回，不消耗额度。
+const (
+	searchQPS   = 30
+	searchBurst = 60
+)
+
+// SearchLimit 检索页限流中间件（挂在页面缓存之后）。
+func SearchLimit() iris.Handler {
+	b := newTokenBucket(searchQPS, searchBurst)
+	return func(ctx iris.Context) {
+		if !b.allow() {
+			ctx.StatusCode(iris.StatusTooManyRequests)
+			ctx.Header("Retry-After", "1")
+			ctx.WriteString("请求过于频繁，请稍后再试")
+			ctx.StopExecution()
+			return
+		}
+		ctx.Next()
+	}
+}
+
 // RateLimit 开放 API 限流中间件：超过配额返回 429（JSON），并给出 Retry-After。
 // 返回的实例可挂在多个路由上共享同一个桶（即这些路由合计受限）。
 func RateLimit() iris.Handler {

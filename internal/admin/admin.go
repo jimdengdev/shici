@@ -23,6 +23,7 @@ import (
 
 	"shici/internal/model"
 	"shici/internal/store"
+	"shici/internal/web"
 )
 
 // AdminPageSize 后台列表每页条数。
@@ -141,6 +142,7 @@ func view(ctx iris.Context, name string, data iris.Map) {
 		data = iris.Map{}
 	}
 	data["CSRF"] = csrfToken(ctx)
+	data["AssetVersion"] = web.AssetVersion()
 	ctx.View(name, data)
 }
 

@@ -105,6 +105,7 @@ curl 'http://localhost:8080/api/poem?title=%E9%9D%99%E5%A4%9C%E6%80%9D'
 - **诗人派生**：无诗人表，`author` 聚合出诗人列表与作品数；诗人详情路由以姓名作为标识
 - **元数据缓存**：朝代/体裁列表（10 分钟）与收录统计（1 分钟）短 TTL 缓存，写操作后立即失效
 - **零外部资源**：模板、样式全部 `go:embed` 内嵌，单二进制部署；古典水墨风 CSS
+- **静态资源长缓存**：按内容哈希生成 ETag 与 `?v=<版本>`，浏览器可缓存一年（`immutable`）
 - 今日诗词按日期确定性轮换（同一天稳定、跨天更换）；随机/每日取词用主键区间采样，避免 `ORDER BY RAND()` 全表排序
 
 ## 目录结构
@@ -203,7 +204,7 @@ sudo systemctl restart mysql
 
 做了什么：
 
-- **复合索引**：`(status, id)` / `(status, dynasty, id)` / `(status, category, id)` / `(status, featured, id)` / `(author, id)` / `(status, author, dynasty)`。列表页固定 `WHERE status='published' ORDER BY id`，只有单列 `idx_poems_status` 时会退化成「全表取 + filesort + 临时表」，这也是 CPU 打满的主因；补上后分页变成索引顺序扫描，`LIMIT/OFFSET` 不再排序
+- **复合索引**：`(status, dynasty, id)` / `(status, category, id)` / `(status, featured, id)` / `(status, author, dynasty)`。列表页固定 `WHERE status='published' ORDER BY id`，只有单列 `idx_poems_status` 时会退化成「全表取 + filesort + 临时表」；补上后分页变成索引顺序扫描，`LIMIT/OFFSET` 不再排序。因为 InnoDB 二级索引自带主键后缀，`(status, id)` / `(author, id)` 与 `idx_poems_status` / `idx_poems_author` 等价，不再单独创建；历史库可执行 `ALTER TABLE poems DROP INDEX idx_poems_status_id, DROP INDEX idx_poems_author_id;` 精简索引
 - **缓冲池**：`innodb_buffer_pool_size=256M`（1G 机器约 25%，留足给应用与系统），热数据命中内存后磁盘 IO 与 CPU 都明显下降
 - **关闭 `performance_schema`**：1G 机器可省 100~300M 常驻内存；问题排查交给慢日志（`long_query_time=1`）
 - **`innodb_flush_log_at_trx_commit=2`**：崩溃最多丢 1 秒事务，换写入吞吐；对数据安全性要求高时改回 `1`
@@ -212,9 +213,9 @@ sudo systemctl restart mysql
 验证：
 
 ```sql
-SHOW INDEX FROM poems;                       -- 六个复合索引齐全
+SHOW INDEX FROM poems;                       -- 四个复合索引齐全
 EXPLAIN SELECT id FROM poems WHERE status='published' ORDER BY id LIMIT 20;
--- 期望 key = idx_poems_status_id，且 Extra 中没有 Using filesort / Using temporary
+-- 期望 key = idx_poems_status 或 idx_poems_status_id，且无 Using filesort / Using temporary
 ```
 
 > 说明：全文检索依赖 `ft_poems_search`（ngram），单字关键词仍会降级 `LIKE '%词%'` 全表扫描，这是预期行为，短关键词请尽量少用。
