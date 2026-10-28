@@ -28,3 +28,8 @@ services:
       - "host.docker.internal:host-gateway" # 容器访问宿主机 MySQL（1Panel 安装）
     volumes:
       - ./data:/app/data # SQLite 回退模式的数据持久化目录
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3

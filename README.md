@@ -106,7 +106,7 @@ curl 'http://localhost:8080/api/poem?title=%E9%9D%99%E5%A4%9C%E6%80%9D'
 - **双存储后端**：SQLite（`modernc.org/sqlite` 纯 Go 无 CGO，默认）与 MySQL（`go-sql-driver/mysql`），方言差异（DDL / 连接池 / JSON 标签）收敛在 `internal/store`，业务层无感
 - **关键词检索走 ngram 全文索引**：`poems` 表已有 `ft_poems_search(title,author,content,translation,annotation) WITH PARSER ngram`，连接时自动探测（自建库自动补建）；查询用 `MATCH … AGAINST(? IN BOOLEAN MODE)` 过滤、按 `NATURAL LANGUAGE MODE` 相关度排序，单字关键词或索引不可用时自动降级 `LIKE`
 - **诗人派生**：无诗人表，`author` 聚合出诗人列表与作品数；诗人详情路由以姓名作为标识
-- **元数据缓存**：朝代/体裁列表（10 分钟）与收录统计（1 分钟）短 TTL 缓存，写操作后立即失效
+- **元数据缓存**：朝代/体裁列表（24h）与收录统计（6h）长 TTL 缓存，写操作后立即失效
 - **零外部资源**：模板、样式全部 `go:embed` 内嵌，单二进制部署；古典水墨风 CSS
 - **SEO**：每页独立 description / canonical / OG 标签，诗词详情页输出 schema.org JSON-LD；筛选与分页页 `noindex`；`robots.txt` + 分片 `sitemap.xml`（34 万作品按 45k 自动分片）
 - **安全**：后台 CSRF 令牌、登录限流、常量时间口令比较；应用层输出 `X-Content-Type-Options` / `X-Frame-Options` / `Referrer-Policy`
@@ -189,6 +189,8 @@ sudo systemctl daemon-reload && sudo systemctl restart caddy
 - 先用 `SITE_ADDRESS=:80` 通过 IP 访问；**配好域名后把 `SITE_ADDRESS` 改成域名**，Caddy 自动申请续期 HTTPS（HTTP 请求自动 308 跳转），无需改配置文件
 - 套 Cloudflare 代理（橙云）时，SSL/TLS 模式请选 **Full (strict)**：源站已是有效证书，选 Flexible 会因为源站强制 HTTPS 造成重定向循环；仅 DNS（灰云）则无需额外设置
 - 应用侧 `SHICI_HOST=127.0.0.1` + 端口只在回环监听，外网无法直连应用端口
+- 配好域名后设置 `SHICI_SITE_URL=https://你的域名`：canonical、OG、sitemap 里的绝对地址都取自它（不设则按请求头推断，反代漏传头时可能生成 http 地址）
+- 验证 SEO：`curl -s https://<站点>/robots.txt`、`curl -s https://<站点>/sitemap.xml | head`
 - 验证：`curl -I http://<站点>`（HEAD 也返回 200）、`nc -z <站点> <应用端口>` 应失败
 - 日志：应用 `journalctl -u shici -f`，访问日志 `/var/log/caddy/shici-access.log`
 
@@ -213,7 +215,7 @@ sudo systemctl restart mysql
 - **缓冲池**：`innodb_buffer_pool_size=256M`（1G 机器约 25%，留足给应用与系统），热数据命中内存后磁盘 IO 与 CPU 都明显下降
 - **关闭 `performance_schema`**：1G 机器可省 100~300M 常驻内存；问题排查交给慢日志（`long_query_time=1`）
 - **`innodb_flush_log_at_trx_commit=2`**：崩溃最多丢 1 秒事务，换写入吞吐；对数据安全性要求高时改回 `1`
-- **应用侧**：检索总数（`COUNT(*)`）缓存 30s、诗人榜（`GROUP BY author`）缓存 5 分钟，后台写入时自动失效；MySQL 连接池空闲 5 分钟后归还
+- **应用侧**：检索总数（`COUNT(*)`）缓存 30min、诗人榜（`GROUP BY author`）缓存 12h，后台写入时自动失效；MySQL 连接池空闲 5 分钟后归还
 
 验证：
 

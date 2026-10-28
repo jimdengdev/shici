@@ -84,9 +84,13 @@ var cacheJunkParams = map[string]bool{
 // pageCacheKey 规范化缓存键：排序查询参数、丢弃空值与跟踪参数，
 // 避免同一页面因参数顺序或 utm_* 产生大量重复条目（缓存污染）。
 func pageCacheKey(r *http.Request) string {
-	u, err := url.ParseRequestURI(r.RequestURI)
+	raw := r.RequestURI
+	if raw == "" {
+		raw = r.URL.RequestURI() // 测试/客户端构造的请求没有 RequestURI
+	}
+	u, err := url.ParseRequestURI(raw)
 	if err != nil {
-		return r.RequestURI
+		return raw
 	}
 	q := u.Query()
 	for k, vs := range q {

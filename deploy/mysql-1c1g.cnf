@@ -1,0 +1,43 @@
+# 诗词雅集 —— MySQL 8.0 参数模板（1 vCPU / 1G RAM / 20G 磁盘）
+#
+# 用法：
+#   系统包：  cp deploy/mysql-1c1g.cnf /etc/mysql/mysql.conf.d/zz-1c1g.cnf
+#             sudo systemctl restart mysql
+#   1Panel：  容器 → 参数 → 配置文件，把下面的键值逐项加入 [mysqld]
+#   云数据库：控制台「参数设置 / 参数组」逐项调整（无法直接改 my.cnf）
+#
+# 注意：
+#   - ngram_token_size 需与既有全文索引一致（默认 2），修改后必须重建索引
+#   - innodb_redo_log_capacity 仅 8.0.30+ 支持；更早版本改用 innodb_log_file_size=64M
+#   - 修改前先备份，参数写错会导致 MySQL 启动失败
+
+[mysqld]
+# 内存：缓冲池约占 1G 机器的 25%，其余留给应用 / OS
+innodb_buffer_pool_size = 256M
+
+# 8.0.30+ 使用 redo_log_capacity；更低版本注释本行并启用下一行
+innodb_redo_log_capacity = 128M
+# innodb_log_file_size = 64M
+
+# 每次事务不强制刷盘，崩溃最多丢 1 秒；对数据安全要求高时改回 1
+innodb_flush_log_at_trx_commit = 2
+
+# 小内存机器关闭 performance_schema（约省 100~300M），排查依赖慢日志
+performance_schema = OFF
+
+# 连接数：应用连接池上限 10，30 足够且更省内存
+max_connections = 30
+
+# 临时表 / 排序 / 连接缓冲（按连接分配，小内存禁止调大）
+tmp_table_size = 32M
+max_heap_table_size = 32M
+sort_buffer_size = 1M
+join_buffer_size = 1M
+
+# 慢查询日志：定位未走索引的语句
+slow_query_log = ON
+long_query_time = 1
+slow_query_log_file = /var/log/mysql/slow.log
+
+# 中文 ngram 分词长度（与现有全文索引一致）
+ngram_token_size = 2
